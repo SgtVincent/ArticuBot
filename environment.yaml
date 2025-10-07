@@ -1,13 +1,15 @@
 name: articubot
 channels:
-  - anaconda
+  # - anaconda
+  - conda-forge
   - pytorch
   - nvidia
-  - conda-forge
   - defaults
 dependencies:
   - _libgcc_mutex=0.1=main
   - _openmp_mutex=5.1=1_gnu
+  - gxx=11
+  - gcc=11
   - antlr-python-runtime=4.9.3=pyhd8ed1ab_1
   - blas=1.0=mkl
   - boost=1.78.0=py39hac2352c_0
@@ -116,6 +118,14 @@ dependencies:
   - yaml=0.2.5=h7b6447c_0
   - zlib=1.2.13=h5eee18b_0
   - zstd=1.5.2=ha4553b6_0
+  # trac_ik dependencies 
+  - swig 
+  # - orocos-kdl 
+  - conda-forge::python-orocos-kdl
+  # NOTE: if you want to change the installed ros distribution, please change the name
+  - robostack::ros-noetic-kdl-parser
+  - nlopt
+
   - pip:
       - absl-py==1.4.0
       - accelerate==0.21.0

@@ -1,5 +1,5 @@
 import numpy as np
-from manipulation.utils import build_up_env
+from manipulation.utils import build_up_env_gen
 from manipulation.utils import load_env, rotation_transfer_6D_to_matrix, rotation_transfer_matrix_to_6D
 import os
 import pickle
@@ -119,7 +119,7 @@ def extract_pc_states_for_all_trajectories(pool_args):
             if 'name' in config_dict:
                 object_name = config_dict['name'].lower()
 
-        simulator, _ = build_up_env(
+        simulator, _ = build_up_env_gen(
             task_config=task_config_path,
             env_name=env_name,
             restore_state_file=None,

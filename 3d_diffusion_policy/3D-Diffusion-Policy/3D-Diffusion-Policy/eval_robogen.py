@@ -17,16 +17,40 @@ import pickle as pkl
 import argparse
 from typing import List, Optional
 from collections import deque
+# add project root to sys.path
+sys.path.append(str(pathlib.Path(__file__).resolve().parent.parent.parent.parent))
+
 from manipulation.robogen_wrapper import RobogenPointCloudWrapper
 from diffusion_policy_3d.gym_util.multistep_wrapper import MultiStepWrapper
 from train_ddp import TrainDP3Workspace
 from diffusion_policy_3d.common.pytorch_util import dict_apply
-from manipulation.utils import build_up_env, save_numpy_as_gif
+from manipulation.utils import build_up_env_eval, save_numpy_as_gif
 
 def construct_env(cfg, config_file, solution_path, task_name, init_state_file, 
                   real_world_camera=False, noise_real_world_pcd=False,
                   randomize_camera=False):
-    env, _ = build_up_env(
+    """Construct and return a wrapped Robogen environment for evaluation.
+
+    This builds the base environment using `build_up_env`, wraps it with
+    `RobogenPointCloudWrapper` to provide point-cloud observations, and then
+    places it inside `MultiStepWrapper` so the environment returns sequences
+    of observations and supports multi-step actions.
+
+    Args:
+        cfg: Hydrated experiment config containing environment/task settings.
+        config_file (str): Path to the task-specific config file.
+        solution_path (str): Solution path (relative to PROJECT_DIR) used by the task.
+        task_name (str): The task/primitive name to instantiate.
+        init_state_file (str): Path to the initial state file used to seed the env.
+        real_world_camera (bool): If True, emulate real-world camera behavior.
+        noise_real_world_pcd (bool): If True, add noise to point-clouds.
+        randomize_camera (bool): If True, randomize camera poses on reset.
+
+    Returns:
+        A `MultiStepWrapper`-wrapped environment that provides point-cloud-based
+        observations and supports stepping with low-level actions.
+    """
+    env, _ = build_up_env_eval(
                     config_file,
                     solution_path,
                     task_name,
@@ -52,6 +76,24 @@ def construct_env(cfg, config_file, solution_path, task_name, init_state_file,
     return env
 
 def prepare_env(experiment_folder, experiment_path, all_experiments):
+    """Gather config, init-state paths and expert angles for trials.
+
+    Scans `all_experiments` inside `experiment_path` and returns three lists:
+      - config_files: paths to `task_config.yaml` for each valid trial
+      - init_state_files: paths to initial state pickle files (state_0.pkl)
+      - expert_opened_angles: expert final joint angles parsed from
+        `opened_angle.txt` when available
+
+    Trials missing required files or marked as invalid are skipped.
+
+    Args:
+        experiment_folder (str): Path where `substeps.txt` resides.
+        experiment_path (str): Path containing per-trial folders.
+        all_experiments (list[str]): Names of trial subfolders to consider.
+
+    Returns:
+        Tuple of (config_files, init_state_files, expert_opened_angles).
+    """
     all_substeps_path = os.path.join(experiment_folder, "substeps.txt")
     with open(all_substeps_path, "r") as f:
         substeps = f.readlines()
@@ -93,6 +135,23 @@ def prepare_env(experiment_folder, experiment_path, all_experiments):
     return config_files, init_state_files, expert_opened_angles
 
 def high_level_policy_infer(parallel_input_dict, high_level_policy, output_obj_pcd_only=True):
+    """Run the high-level point-cloud policy and produce a goal point cloud.
+
+    Prepares batched inputs from `parallel_input_dict`, optionally adds a
+    one-hot modality encoding, runs `high_level_policy` in no-grad mode, and
+    aggregates the per-point predictions using predicted weights into a single
+    goal point-cloud tensor.
+
+    Args:
+        parallel_input_dict (dict): Batched inputs (point_cloud, gripper_pcd, etc.),
+            usually as torch tensors on CUDA.
+        high_level_policy (torch.nn.Module): High-level model loaded on CUDA.
+        output_obj_pcd_only (bool): If True, exclude gripper points from the
+            network outputs and only return the object prediction.
+
+    Returns:
+        torch.Tensor: Goal point cloud with shape (B, 1, M, 3).
+    """
     with torch.no_grad():
         pointcloud = parallel_input_dict['point_cloud'][:, -1, :, :]
         gripper_pcd = parallel_input_dict['gripper_pcd'][:, -1, :]
@@ -141,7 +200,33 @@ def run_eval_non_parallel(cfg, low_level_policy, high_level_policy,
                           real_world_camera=False, 
                           noise_real_world_pcd=False,
                           randomize_camera=False):
-    
+    """Evaluate the high-level and low-level policies on configured trials.
+
+    Iterates over datasets described in `cfg.task.env_runner`, constructs
+    environments for each trial, runs a closed-loop where the high-level
+    policy proposes goals (periodically) and the low-level policy produces
+    actions to reach them, steps the environment, and stores statistics and
+    GIF visualizations under `save_path`.
+
+    Args:
+        cfg: Hydrated experiment configuration object.
+        low_level_policy: Low-level controller with `predict_action` method.
+        high_level_policy: High-level model that predicts goal point-clouds.
+        save_path (str): Directory where results (JSON + GIFs) are saved.
+        exp_beg_idx (int): Starting index into available trial configs.
+        exp_end_idx (int): One-past-last index into available trial configs.
+        horizon (int): Number of environment steps to run per trial.
+        exp_beg_ratio/exp_end_ratio (float|None): If provided, interpret begin
+            and end indices as ratios of the available configs.
+        dataset_index (int|None): If set, override which dataset index to process.
+        output_obj_pcd_only (bool): Forwarded to `high_level_policy_infer`.
+        update_goal_freq (int): Frequency (in env steps) to recompute the goal.
+        real_world_camera, noise_real_world_pcd, randomize_camera (bool): Env flags.
+
+    Side effects:
+        Writes per-dataset JSON files named `opened_joint_angles_<dataset_idx>.json`
+        and saves GIFs showing the episode rollout under `save_path`.
+    """
     ### loop through each test object
     for dataset_idx, (experiment_folder, experiment_name) in enumerate(zip(cfg.task.env_runner.experiment_folder, cfg.task.env_runner.experiment_name)):
 

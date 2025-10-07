@@ -9,7 +9,7 @@ import time
 import datetime
 import multiprocessing as mp
 from termcolor import cprint
-from manipulation.utils import build_up_env, save_numpy_as_gif,  parse_center
+from manipulation.utils import build_up_env_gen, save_numpy_as_gif,  parse_center
 
 def get_all_test_configs(root_dir='data/temp', extract_name=None):
     all_tasks = os.listdir(root_dir)
@@ -91,7 +91,7 @@ def _gen_init_state(q, config_path, env_name, render, far_distance=0.7, near_dis
             print("base pos: ", base_pos)
 
     # create env
-    env, _ =  build_up_env(config_path, env_name, render=render)
+    env, _ =  build_up_env_gen(config_path, env_name, render=render)
     env.reset()
 
     # get the joint limits for the robot arm, using a smaller range
@@ -265,7 +265,7 @@ def _execute(q, config_path, env_name, solution_path, experiment_path, time_stri
     
     # execute primitive
     print("execute primitive")
-    env, _ = build_up_env(config_path, env_name)
+    env, _ = build_up_env_gen(config_path, env_name)
     env.primitive_save_path = experiment_path
     np.random.seed(time.time_ns() % 2**32)
 

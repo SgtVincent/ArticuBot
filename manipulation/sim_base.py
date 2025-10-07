@@ -12,13 +12,10 @@ from manipulation.panda import Panda
 from manipulation.utils import *
 import time
 import scipy
-from scipy import ndimage
 import os
-import json
-from typing import Optional, List
-import open3d as o3d
+from typing import Optional, List, Dict
 
-class SimpleEnv(gym.Env):
+class SimpleEnvBase(gym.Env):
     def __init__(self, 
                     dt=1/240, 
                     config_path=None, 
@@ -32,6 +29,7 @@ class SimpleEnv(gym.Env):
                     task_name=None,
                     open_gripper_at_reset=True,
                     ik_limit=True,
+                    mobile=False,
                     **kargs
                 ):
         
@@ -51,6 +49,7 @@ class SimpleEnv(gym.Env):
         self.randomize = randomize
         self.obj_id = obj_id # which object to choose to use from the candidates
         self.open_gripper_at_reset = open_gripper_at_reset
+        self.mobile = mobile
         
         # robot
         self.ik_limit = ik_limit
@@ -58,6 +57,20 @@ class SimpleEnv(gym.Env):
         # physics
         self.gravity = -9.81
         self.vhacd = vhacd
+
+        # environment bounding boxes (populated during config/object loading)
+        self.table_bbox_min = None
+        self.table_bbox_max = None
+        self.table_height = None
+        self.workspace_min = np.array([-1.0, -1.0, 0.0])
+        self.workspace_max = np.array([1.0, 1.0, 1.0])
+
+        # config level caches
+        self.articulated_init_joint_angles = {}
+        self.spatial_relationships = []
+        self.robot_initial_joint_angles = None
+        self.robot_initial_finger_angle = None
+        self.distractor_config_path = None
         
         if self.gui:
             try:
@@ -189,8 +202,25 @@ class SimpleEnv(gym.Env):
             "robot": 0,
             "plane": 0,
         }
-        urdf_paths, urdf_sizes, urdf_positions, urdf_orientations, urdf_names, urdf_types, urdf_on_table, urdf_movables, urdf_crop_sizes, \
-            use_table, articulated_init_joint_angles, spatial_relationships, robot_initial_joint_angles, robot_initial_finger_angle = self.load_and_parse_config(restore_state)
+        (urdf_paths,
+         urdf_sizes,
+         urdf_positions,
+         urdf_orientations,
+         urdf_names,
+         urdf_types,
+         urdf_on_table,
+         urdf_movables,
+         urdf_crop_sizes,
+         use_table,
+         articulated_init_joint_angles,
+         spatial_relationships,
+         robot_initial_joint_angles,
+         robot_initial_finger_angle) = self.load_and_parse_config(restore_state)
+
+        self.articulated_init_joint_angles = articulated_init_joint_angles or {}
+        self.spatial_relationships = spatial_relationships or []
+        self.robot_initial_joint_angles = robot_initial_joint_angles
+        self.robot_initial_finger_angle = robot_initial_finger_angle
 
         ### load plane 
         planeId = p.loadURDF(osp.join(self.asset_dir, "plane", "plane.urdf"), physicsClientId=self.id)
@@ -221,10 +251,13 @@ class SimpleEnv(gym.Env):
         object_height = self.adjust_object_positions(self.robot_base_pos)
 
         ### resolve collisions between objects
-        self.resolve_collision(self.robot_base_pos, object_height, spatial_relationships)
+        self.resolve_collision(self.robot_base_pos, object_height, self.spatial_relationships)
 
         ### set all object's joint angles to the lower joint limit
         self.set_to_default_joint_angles()
+
+        # allow subclass to customize articulation specific setup
+        self.apply_articulated_joint_angles(self.articulated_init_joint_angles)
 
         # open the gripper at reset 
         if self.open_gripper_at_reset:
@@ -265,8 +298,13 @@ class SimpleEnv(gym.Env):
         self.robot = self.robot_class()
         self.robot.init(self.asset_dir, self.id, self.np_random, fixed_base=True, ik_limit=self.ik_limit)
         self.agents = [self.robot]
+        if robot_initial_joint_angles is None and self.robot_initial_joint_angles is not None:
+            robot_initial_joint_angles = self.robot_initial_joint_angles
         if robot_initial_finger_angle is None:
-            robot_initial_finger_angle = self.robot.finger_fully_open_joint_angle
+            if self.robot_initial_finger_angle is not None:
+                robot_initial_finger_angle = self.robot_initial_finger_angle
+            else:
+                robot_initial_finger_angle = self.robot.finger_fully_open_joint_angle
 
         # Set robot base position & orientation, and joint angles
         robot_base_pos = self.get_robot_base_pos()
@@ -278,6 +316,7 @@ class SimpleEnv(gym.Env):
         self.robot.set_gripper_open_position(self.robot.right_gripper_indices, [robot_initial_finger_angle, robot_initial_finger_angle], set_instantly=True)
                 
         self.robot.set_gravity(0, 0, 0)
+        self.after_robot_initialized()
         return robot_base_pos        
     
     def load_and_parse_config(self, restore_state):
@@ -291,17 +330,29 @@ class SimpleEnv(gym.Env):
                 break
         
         ### parse config
-        urdf_paths, urdf_sizes, urdf_positions, urdf_orientations, urdf_names, urdf_types, urdf_on_table, \
-            use_table, urdf_crop_sizes, articulated_init_joint_angles, spatial_relationships, distractor_config_path, urdf_movables, \
-                robot_initial_joint_angles, robot_initial_finger_angle = parse_config(self.config, 
-                        obj_id=self.obj_id,
-                        use_vhacd=True)
+        (urdf_paths,
+         urdf_sizes,
+         urdf_positions,
+         urdf_orientations,
+         urdf_names,
+         urdf_types,
+         urdf_on_table,
+         use_table,
+         urdf_crop_sizes,
+         articulated_init_joint_angles,
+         spatial_relationships,
+         distractor_config_path,
+         urdf_movables,
+         robot_initial_joint_angles,
+         robot_initial_finger_angle) = self._parse_config()
                 
         if not use_table:
             urdf_on_table = [False for _ in urdf_on_table]
         urdf_names = [x.lower() for x in urdf_names]
         for name in urdf_names:
             self.is_distractor[name] = 0
+
+        self.distractor_config_path = distractor_config_path
         
         if restore_state is not None:
             if "urdf_paths" in restore_state:
@@ -321,8 +372,20 @@ class SimpleEnv(gym.Env):
                 self.simulator_sizes = restore_state['object_sizes']
                 urdf_sizes = [self.simulator_sizes[name] for name in urdf_names]
                 
-        return urdf_paths, urdf_sizes, urdf_positions, urdf_orientations, urdf_names, urdf_types, urdf_on_table, urdf_movables, urdf_crop_sizes, \
-            use_table, articulated_init_joint_angles, spatial_relationships, robot_initial_joint_angles, robot_initial_finger_angle
+        return (urdf_paths,
+            urdf_sizes,
+            urdf_positions,
+            urdf_orientations,
+            urdf_names,
+            urdf_types,
+            urdf_on_table,
+            urdf_movables,
+            urdf_crop_sizes,
+            use_table,
+            articulated_init_joint_angles,
+            spatial_relationships,
+            robot_initial_joint_angles,
+            robot_initial_finger_angle)
         
                 
     def load_object(self, urdf_paths, urdf_sizes, urdf_positions, urdf_orientations, urdf_names, urdf_types, urdf_on_table, urdf_movables, urdf_crop_sizes):
@@ -396,6 +459,12 @@ class SimpleEnv(gym.Env):
             self.init_positions[name] = np.array(load_pos)
             self.init_orientations[name] = orientation
             self.on_tables[name] = on_table
+
+            if name == 'init_table':
+                min_aabb, max_aabb = self.get_aabb(id)
+                self.table_bbox_min = np.array(min_aabb)
+                self.table_bbox_max = np.array(max_aabb)
+                self.table_height = float(max_aabb[2])
     
     def adjust_object_positions(self, robot_base_pos):
         object_height = {}
@@ -722,178 +791,24 @@ class SimpleEnv(gym.Env):
     def _get_obs(self):
         ### not really used, will be overridden by the robogenpointcloud wrapper class. 
         obs = np.zeros(self.base_observation_space.shape[0])
-    
 
-    def take_round_images(self, center, distance, elevation=30, azimuth_interval=30, camera_width=640, camera_height=480, return_camera_matrices=False):
-        camera_target = center
-        delta_z = distance * np.sin(np.deg2rad(elevation))
-        xy_distance = distance * np.cos(np.deg2rad(elevation))
+    def apply_articulated_joint_angles(self, articulated_init_joint_angles):
+        """Hook for subclasses that need to set articulated joint angles."""
+        return
 
-        prev_view_matrix, prev_projection_matrix = self.view_matrix, self.projection_matrix
+    def after_robot_initialized(self):
+        """Hook invoked after the robot has been instantiated."""
+        return
 
-        rgbs = []
-        depths = []
-        view_camera_matrices = []
-        project_camera_matrices = []
-        for azimuth in range(0, 360, azimuth_interval):
-            delta_x = xy_distance * np.cos(np.deg2rad(azimuth))
-            delta_y = xy_distance * np.sin(np.deg2rad(azimuth))
-            camera_position = [camera_target[0] + delta_x, camera_target[1] + delta_y, camera_target[2] + delta_z]
-            self.setup_camera(camera_position, camera_target, 
-                                camera_width=camera_width, camera_height=camera_height)
-
-            rgb, depth = self.render(return_depth=True)
-            rgbs.append(rgb)
-            depths.append(depth)
-            view_camera_matrices.append(self.view_matrix)
-            project_camera_matrices.append(self.projection_matrix)
-        
-        self.view_matrix, self.projection_matrix = prev_view_matrix, prev_projection_matrix
-
-        if not return_camera_matrices:
-            return rgbs, depths
-        else:
-            return rgbs, depths, view_camera_matrices, project_camera_matrices
-
-    def get_link_pc(self, object_name, urdf_link_name):
-        object_name = object_name.lower()
-        object_id = self.urdf_ids[object_name]
-        prev_rgbas = []
-        ### make all other objects invisiable
-        for obj_name, obj_id in self.urdf_ids.items():
-            if obj_name != object_name:
-                num_links = p.getNumJoints(obj_id, physicsClientId=self.id)
-                for link_idx in range(-1, num_links):
-                    prev_rgba = p.getVisualShapeData(obj_id, link_idx, physicsClientId=self.id)[0][14:18]
-                    prev_rgbas.append(prev_rgba)
-                    p.changeVisualShape(obj_id, link_idx, rgbaColor=[0, 0, 0, 0], physicsClientId=self.id)
-
-        ### center camera to the target object
-        env_prev_view_matrix, env_prev_projection_matrix = self.view_matrix, self.projection_matrix
-        camera_width = 640
-        camera_height = 480
-        obj_id = object_id
-        min_aabb, max_aabb = self.get_aabb(obj_id)
-        camera_target = (max_aabb + min_aabb) / 2
-        # distance = np.linalg.norm(max_aabb - min_aabb) * 1.2
-        distance = np.linalg.norm(max_aabb - min_aabb) * 1.2 if self.robot_name == 'panda' else np.linalg.norm(max_aabb - min_aabb) * 0.8
-        elevation = 30
-
-        ### get a round of images of the target object
-        imgs, depths, view_matrices, projection_matrices = self.take_round_images(
-            camera_target, distance, elevation, 
-            camera_width=camera_width, camera_height=camera_height, 
-            return_camera_matrices=True)
-        
-       
-
-        link_id = self.get_link_id_from_name(object_name, urdf_link_name)
-        # print("urdf_link_name: ", urdf_link_name)
-        # import pdb; pdb.set_trace()
-        prev_link_rgba = p.getVisualShapeData(obj_id, link_id, physicsClientId=self.id)[0][14:18]
-        p.changeVisualShape(obj_id, link_id, rgbaColor=[0, 0, 0, 0], physicsClientId=self.id)
-
-        ### get a round of images of the target object with link invisiable
-        img_invisible, depths_link_invisible, _, _ = self.take_round_images(
-            camera_target, distance, elevation,
-            camera_width=camera_width, camera_height=camera_height, 
-            return_camera_matrices=True
+    def _parse_config(self):
+        return parse_config(
+            self.config,
+            obj_id=self.obj_id,
+            use_vhacd=True,
         )
-
-        ### use subtraction to get the link mask
-        max_num_diff_pixels = 0
-        best_idx = 0
-        all_pc = []
-        for idx, (depth, depth_) in enumerate(zip(depths, depths_link_invisible)):
-            diff_image = np.abs(depth - depth_)
-            mask = diff_image > 0
-            diff_pixels = np.sum(mask)
-            if diff_pixels > max_num_diff_pixels:
-                max_num_diff_pixels = diff_pixels
-                best_idx = idx
-            pc = get_pc(projection_matrices[idx], view_matrices[idx], depths[idx], camera_width, camera_height)
-            pc = pc.reshape((camera_height, camera_width, 3))
-            pc_masked = pc[mask]
-            all_pc.append(pc_masked)
-        
-        all_pc = np.concatenate(all_pc, axis=0)
-
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(all_pc)
-        downsampled_pcd = pcd.voxel_down_sample(voxel_size=0.005)
-        all_pc = np.asarray(downsampled_pcd.points)
-
-        import imageio
-        imageio.imwrite("img_invisible.png", img_invisible[best_idx])
-
-        best_view_matrix = view_matrices[best_idx]
-        best_projection_matrix = projection_matrices[best_idx]
-        best_img = imgs[best_idx]
-        ### reset the object and link rgba to previous values, and the simulator view matrix and projection matrix
-        p.changeVisualShape(obj_id, link_id, rgbaColor=prev_link_rgba, physicsClientId=self.id)
-
-        cnt = 0
-        for obj_name, obj_id in self.urdf_ids.items():
-            if obj_name != object_name:
-                num_links = p.getNumJoints(obj_id, physicsClientId=self.id)
-                for link_idx in range(-1, num_links):
-                    p.changeVisualShape(obj_id, link_idx, rgbaColor=prev_rgbas[cnt], physicsClientId=self.id)
-                    cnt += 1
-
-        self.view_matrix, self.projection_matrix = env_prev_view_matrix, env_prev_projection_matrix
-
-        return all_pc, best_view_matrix, best_projection_matrix, best_img
-
-    def get_link_id_from_name(self, object_name, link_name):
-        object_id = self.urdf_ids[object_name]
-        num_joints = p.getNumJoints(object_id, physicsClientId=self.id)
-        joint_index = None
-        for i in range(num_joints):
-            joint_info = p.getJointInfo(object_id, i, physicsClientId=self.id)
-            if joint_info[12].decode('utf-8') == link_name:
-                joint_index = i
-                break
-
-        return joint_index
-    
-    def get_joint_id_from_name(self, object_name, joint_name):
-        object_id = self.urdf_ids[object_name]
-        num_joints = p.getNumJoints(object_id, physicsClientId=self.id)
-        joint_index = None
-        for i in range(num_joints):
-            joint_info = p.getJointInfo(object_id, i, physicsClientId=self.id)
-            if joint_info[1].decode('utf-8') == joint_name:
-                joint_index = i
-                break
-
-        return joint_index
-    
-    def get_bounding_box(self, object_name):
-        object_name = object_name.lower()
-        object_id = self.urdf_ids[object_name]
-        if object_name != "init_table":
-            return self.get_aabb(object_id)
-        else:
-            return self.table_bbox_min, self.table_bbox_max
-        
-    def get_bounding_box_link(self, object_name, link_name):
-        object_name = object_name.lower()
-        object_id = self.urdf_ids[object_name]
-        link_id = self.get_link_id_from_name(object_name, link_name)
-        object_id = self.urdf_ids[object_name]
-        return self.get_aabb_link(object_id, link_id)
-    
-    def get_link_pose(self, object_name, custom_link_name):
-        object_name = object_name.lower()
-        object_id = self.urdf_ids[object_name]
-        urdf_link_name = custom_link_name
-        link_id = self.get_link_id_from_name( object_name, urdf_link_name)
-        link_pos, link_orient = p.getLinkState(object_id, link_id, physicsClientId=self.id)[:2]
-        return np.array(link_pos), np.array(link_orient)
 
     def disconnect(self):
         p.disconnect(self.id)
 
     def close(self):
         p.disconnect(self.id)
-    

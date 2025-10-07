@@ -1,4 +1,5 @@
-from manipulation.sim import SimpleEnv
+# from manipulation.sim import SimpleEnv
+from manipulation.sim_data_gen import SimpleEnvDataGen
 from manipulation.primitive_api import *
 import gym
 
@@ -11,7 +12,7 @@ handle_name_dict = {
     'toilet': 'lid',
 }
 
-class articulated(SimpleEnv):
+class articulated(SimpleEnvDataGen):
 
     def __init__(self, task_name, object_name, link_name, init_angle, *args, **kwargs):
         super().__init__(*args, **kwargs)

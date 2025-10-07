@@ -126,11 +126,14 @@ class RobogenPointCloudWrapper:
             config_path = self._env.config_path
             task_name = self._env.task_name
             parent_path = os.path.dirname(config_path)
-            # state_path = os.path.join(parent_path, "{}_primitive".format(task_name), "states") 
-            state_path = os.path.join(parent_path, "states") 
-                
-            # stage_lengths_json_file = os.path.join(parent_path, "{}_primitive".format(task_name), 'stage_lengths.json')
-            stage_lengths_json_file = os.path.join(parent_path, 'stage_lengths.json')
+            
+            # NOTE: the data_gen branch and the main branch have different folder structure
+            state_path = os.path.join(parent_path, "{}_primitive".format(task_name), "states") 
+            stage_lengths_json_file = os.path.join(parent_path, "{}_primitive".format(task_name), 'stage_lengths.json')
+            if not os.path.exists(stage_lengths_json_file):
+                 state_path = os.path.join(parent_path, "states")     
+                 stage_lengths_json_file = os.path.join(parent_path, 'stage_lengths.json')
+            
             with open(stage_lengths_json_file, 'r') as f:
                 stage_lengths = json.load(f)
             open_begin_t_idx = stage_lengths['reach_handle'] + stage_lengths['reach_to_contact'] + stage_lengths['close_gripper']

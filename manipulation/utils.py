@@ -26,7 +26,7 @@ from scipy import ndimage
 # Chialiang
 from scipy.spatial.transform import Rotation as R
 
-workspace = os.environ['PWD']
+workspace = os.environ['PROJECT_DIR']
 data_dir = os.path.join(workspace, "data")
 
 default_config = {
@@ -146,7 +146,35 @@ def load_gif(gif_path):
     frames_arrays = [np.array(frame) for frame in frames]
     return frames_arrays
 
-def build_up_env(task_config=None, env_name=None, task_name=None, restore_state_file=None, return_env_class=False, 
+
+def build_up_env_eval(task_config=None, solution_path=None, task_name=None, restore_state_file=None, return_env_class=False, 
+                    render=False, randomize=False, 
+                    obj_id=0,  **kwargs,
+                ):
+    
+    save_config = copy.deepcopy(default_config)
+    save_config['config_path'] = task_config
+    save_config['task_name'] = task_name
+    save_config['restore_state_file'] = restore_state_file
+    save_config['gui'] = render
+    save_config['randomize'] = randomize
+    save_config['obj_id'] = obj_id
+    save_config['task_name'] = task_name
+    for key, value in kwargs.items():
+        save_config[key] = value
+
+    ### you might want to restore to a specific state
+    module = importlib.import_module("{}.{}".format(solution_path.replace("/", "."), task_name))
+    env_class = getattr(module, task_name)
+    env = env_class(**save_config)
+
+    if not return_env_class:
+        return env, save_config
+    else:
+        return env, save_config, env_class
+
+
+def build_up_env_gen(task_config=None, env_name=None, task_name=None, restore_state_file=None, return_env_class=False, 
                     action_space='delta-translation', render=False, randomize=False, 
                     obj_id=0, random_object_translation: Optional[List]=None, **kwargs,
                 ):

@@ -419,7 +419,7 @@ def parallel_motion_planning(args):
     stage_length = {}
     object_name = object_name.lower()
     
-    simulator, _ = build_up_env(
+    simulator, _ = build_up_env_gen(
         **env_kwargs
     )
     simulator.reset(ori_simulator_state)
