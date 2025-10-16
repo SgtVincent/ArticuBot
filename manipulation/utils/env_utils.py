@@ -150,6 +150,337 @@ def build_up_env_gen(task_config=None, env_name=None, task_name=None, restore_st
     else:
         return env, save_config, env_class
 
+
+def build_up_env_random(task_config=None, env_name='articulated', render=False, 
+                        randomize_object_pose=True, randomize_robot_joints=True,
+                        randomize_initial_joint_angle=True, horizon=600, 
+                        max_attempts=100, far_distance=0.7, near_distance=0.3, **kwargs):
+    """
+    Build and initialize an environment with random collision-free initialization for evaluation.
+    
+    This function creates an environment and performs intelligent randomization similar to 
+    _gen_init_state in gen_demo.py. It ensures:
+    1. No collision between robot and object
+    2. No collision between robot and ground plane
+    3. Object handle/joint is within reachable distance from end effector
+    4. Object faces the robot arm for manipulation
+    
+    Args:
+        task_config (str, optional): Path to task configuration YAML file.
+        env_name (str, optional): Name of environment module (default: 'articulated').
+        render (bool, optional): Enable GUI rendering. Defaults to False.
+        randomize_object_pose (bool, optional): Randomize object position/orientation.
+            Defaults to True.
+        randomize_robot_joints (bool, optional): Randomize robot initial joint angles.
+            Defaults to True.
+        randomize_initial_joint_angle (bool, optional): Randomize articulated joint angle.
+            Defaults to True.
+        horizon (int, optional): Episode horizon. Defaults to 600.
+        max_attempts (int, optional): Maximum attempts to find collision-free state. 
+            Defaults to 100.
+        far_distance (float, optional): Maximum distance from end effector to handle.
+            Defaults to 0.7.
+        near_distance (float, optional): Minimum distance from end effector to handle.
+            Defaults to 0.3.
+        **kwargs: Additional configuration parameters passed to environment.
+    
+    Returns:
+        tuple: (env, save_config) - The initialized environment and its config dict.
+    
+    Example:
+        >>> env, _ = build_up_env_random(
+        ...     task_config='data/custom_objects/color_0025_0_v2/configs/config_500.yaml',
+        ...     render=False
+        ... )
+    """
+    import time
+    
+    # Parse config to get object properties
+    config = yaml.safe_load(open(task_config, "r"))
+    link_name = 'link_0'
+    object_name = None
+    base_pos = None
+    base_euler = None
+    
+    for config_dict in config:
+        if 'name' in config_dict:
+            object_name = config_dict['name'].lower()
+        if 'link_name' in config_dict:
+            link_name = config_dict['link_name']
+        if 'center' in config_dict:
+            center_str = config_dict['center']
+            if isinstance(center_str, str):
+                base_pos = parse_center(center_str)
+            else:
+                base_pos = np.array(center_str)
+        if 'euler' in config_dict:
+            euler_str = config_dict['euler']
+            if isinstance(euler_str, str):
+                base_euler = parse_center(euler_str)
+            else:
+                base_euler = np.array(euler_str)
+    
+    if base_pos is None:
+        base_pos = np.array([0.3, 0.0, 0.0])
+    if base_euler is None:
+        base_euler = np.array([0.0, 0.0, 0.0])
+    
+    # Build environment without restore_state_file
+    save_config = copy.deepcopy(default_config)
+    save_config['config_path'] = task_config
+    save_config['task_name'] = None  # Will be set by environment
+    save_config['object_name'] = object_name
+    save_config['link_name'] = link_name
+    save_config['init_angle'] = None  # Will randomize later
+    save_config['restore_state_file'] = None
+    save_config['gui'] = render
+    save_config['randomize'] = False  # We handle randomization manually
+    save_config['horizon'] = horizon
+    
+    for key, value in kwargs.items():
+        save_config[key] = value
+    
+    # Import and create environment
+    module = importlib.import_module("manipulation.envs.{}".format(env_name))
+    env_class = getattr(module, env_name)
+    env = env_class(**save_config)
+    
+    # Reset to get initial state
+    env.reset()
+    
+    # Get object ID and initial pose
+    object_id = env.urdf_ids[object_name]
+    init_pos, init_orient = p.getBasePositionAndOrientation(object_id, physicsClientId=env.id)
+    init_euler = p.getEulerFromQuaternion(init_orient)
+    
+    # Get robot base position for distance calculations
+    robot_base_pos = p.getBasePositionAndOrientation(env.robot.body, physicsClientId=env.id)[0]
+    
+    # Compute object bounding box to understand its size
+    # Get AABB for all links to find complete object extent
+    num_links = p.getNumJoints(object_id, physicsClientId=env.id)
+    all_aabbs = []
+    
+    # Base link AABB
+    base_aabb = p.getAABB(object_id, -1, physicsClientId=env.id)
+    all_aabbs.append(base_aabb)
+    
+    # All other links
+    for link_idx in range(num_links):
+        link_aabb = p.getAABB(object_id, link_idx, physicsClientId=env.id)
+        all_aabbs.append(link_aabb)
+    
+    # Compute overall bounding box
+    all_mins = [aabb[0] for aabb in all_aabbs]
+    all_maxs = [aabb[1] for aabb in all_aabbs]
+    obj_min = np.min(all_mins, axis=0)
+    obj_max = np.max(all_maxs, axis=0)
+    obj_size = obj_max - obj_min
+    obj_center = (obj_min + obj_max) / 2.0
+    
+    # Calculate minimum safe distance based on object size
+    obj_diagonal = np.linalg.norm(obj_size)
+    min_safe_distance = max(0.15, obj_diagonal * 0.5)  # At least 15cm or half diagonal
+    
+    if render:
+        print(f"Object bounding box size: {obj_size}")
+        print(f"Object diagonal: {obj_diagonal:.3f}m")
+        print(f"Minimum safe distance: {min_safe_distance:.3f}m")
+    
+    # Get robot joint limits with safety margin (20%)
+    low = np.array([-2.9, -1.8, -2.9, -3.1, -2.9, -0.0, -2.9])
+    high = np.array([2.9, 1.8, 2.9, 0.0, 2.9, 3.8, 2.9])
+    joint_range = high - low
+    low = low + joint_range * 0.2
+    high = high - joint_range * 0.2
+    
+    # Find handle joint for articulated objects
+    handle_joint_id = None
+    if randomize_initial_joint_angle:
+        try:
+            handle_joint_id = env.get_handle_joint_id()
+        except (FileNotFoundError, KeyError, AttributeError):
+            # Fallback: find first revolute joint
+            num_joints = p.getNumJoints(object_id, physicsClientId=env.id)
+            for i in range(num_joints):
+                joint_info = p.getJointInfo(object_id, i, physicsClientId=env.id)
+                joint_type = joint_info[2]
+                if joint_type == 0:  # JOINT_REVOLUTE
+                    handle_joint_id = i
+                    break
+            
+            if handle_joint_id is None:
+                print(f"Warning: No revolute joint found for {object_name}")
+    
+    # Don't store handle_joint_id - let environment initialize it properly
+    # The environment's _get_info() will discover and set it on first call
+    
+    # Attempt to find a good collision-free initialization
+    good_init_found = False
+    attempt = 0
+    
+    while not good_init_found and attempt < max_attempts:
+        attempt += 1
+        
+        # 1. Randomize object pose with bounding box awareness
+        if randomize_object_pose:
+            new_pos = np.array(init_pos).copy()
+            # Randomize position ensuring minimum safe distance from robot base
+            # Sample positions that keep object in reachable zone but avoid collision
+            max_offset = 0.15  # Maximum 15cm offset from base position
+            new_pos[0] = base_pos[0] + np.random.uniform(-max_offset, max_offset)
+            new_pos[1] = base_pos[1] + np.random.uniform(-max_offset, max_offset)
+            new_pos[2] = init_pos[2]
+            
+            # Check if new position maintains minimum safe distance from robot base
+            dist_to_robot = np.linalg.norm(new_pos[:2] - np.array(robot_base_pos[:2]))
+            if dist_to_robot < min_safe_distance:
+                # Adjust position to maintain minimum distance
+                direction = (new_pos[:2] - np.array(robot_base_pos[:2]))
+                if np.linalg.norm(direction) > 1e-6:
+                    direction = direction / np.linalg.norm(direction)
+                    new_pos[:2] = np.array(robot_base_pos[:2]) + direction * min_safe_distance
+            
+            new_euler = np.array(init_euler).copy()
+            new_euler[2] = base_euler[2] + np.random.uniform(-np.pi / 6, np.pi / 6)
+            new_orient = p.getQuaternionFromEuler(new_euler)
+            
+            p.resetBasePositionAndOrientation(object_id, new_pos, new_orient, physicsClientId=env.id)
+        
+        # 2. Randomize articulated joint angle
+        if randomize_initial_joint_angle and handle_joint_id is not None:
+            joint_limit_low, joint_limit_high = p.getJointInfo(
+                object_id, handle_joint_id, physicsClientId=env.id
+            )[8:10]
+            # Ensure we stay within valid limits
+            max_init_angle = joint_limit_low + 0.2 * (joint_limit_high - joint_limit_low)
+            # Clamp to ensure we don't exceed the actual limits
+            max_init_angle = min(max_init_angle, joint_limit_high)
+            random_joint = np.random.uniform(joint_limit_low, max_init_angle)
+            p.resetJointState(object_id, handle_joint_id, random_joint, physicsClientId=env.id)
+        
+        # Let object settle
+        for _ in range(5):
+            p.stepSimulation(physicsClientId=env.id)
+        
+        # Verify joint state is stable
+        if randomize_initial_joint_angle and handle_joint_id is not None:
+            current_joint = p.getJointState(object_id, handle_joint_id, physicsClientId=env.id)[0]
+            if abs(current_joint - random_joint) > 1e-3:
+                continue  # Object moved, try again
+        
+        # 3. Randomize robot joint angles and check for collisions
+        robot_attempt = 0
+        robot_good = False
+        
+        while robot_attempt < 100 and not robot_good:
+            robot_attempt += 1
+            
+            # Sample random joint angles
+            if randomize_robot_joints:
+                random_joints = np.random.uniform(low, high)
+                env.robot.set_joint_angles(env.robot.right_arm_joint_indices, random_joints)
+            
+            # Reset object joint after robot movement
+            if randomize_initial_joint_angle and handle_joint_id is not None:
+                p.resetJointState(object_id, handle_joint_id, random_joint, physicsClientId=env.id)
+            
+            # Let robot settle
+            for _ in range(5):
+                p.stepSimulation(physicsClientId=env.id)
+            
+            # Verify joint state is still stable
+            if randomize_initial_joint_angle and handle_joint_id is not None:
+                current_joint = p.getJointState(object_id, handle_joint_id, physicsClientId=env.id)[0]
+                if abs(current_joint - random_joint) > 1e-3:
+                    continue
+            
+            # Check collision between robot and object
+            contact_points = p.getContactPoints(env.robot.body, object_id, physicsClientId=env.id)
+            closest_points = p.getClosestPoints(env.robot.body, object_id, distance=0.01, physicsClientId=env.id)
+            if len(contact_points) > 0 or len(closest_points) > 0:
+                continue
+            
+            # Additional check: verify object bounding box doesn't overlap with robot base area
+            # Update object AABB after randomization
+            obj_aabb_min, obj_aabb_max = p.getAABB(object_id, -1, physicsClientId=env.id)
+            robot_base_pos_current = p.getBasePositionAndOrientation(env.robot.body, physicsClientId=env.id)[0]
+            
+            # Check if object is too close to robot base (XY plane)
+            robot_radius = 0.1  # Approximate robot base radius
+            closest_point_2d = np.array([
+                max(obj_aabb_min[0], min(robot_base_pos_current[0], obj_aabb_max[0])),
+                max(obj_aabb_min[1], min(robot_base_pos_current[1], obj_aabb_max[1]))
+            ])
+            dist_to_base_2d = np.linalg.norm(closest_point_2d - np.array(robot_base_pos_current[:2]))
+            
+            if dist_to_base_2d < robot_radius:
+                continue  # Object too close to robot base
+            
+            # Check collision between robot links and ground plane
+            link_contact = False
+            num_links = p.getNumJoints(env.robot.body, physicsClientId=env.id)
+            for link_idx in range(1, num_links):
+                contact_points = p.getClosestPoints(
+                    bodyA=env.robot.body, linkIndexA=link_idx, 
+                    bodyB=env.urdf_ids['plane'], distance=0.005, 
+                    physicsClientId=env.id
+                )
+                if len(contact_points) > 0:
+                    link_contact = True
+                    break
+            
+            if link_contact:
+                continue
+            
+            # Check if end effector is in good position to grasp handle
+            robot_eef_pos, _ = env.robot.get_pos_orient(env.robot.right_end_effector)
+            
+            # Get handle position directly from PyBullet
+            if handle_joint_id is not None:
+                try:
+                    # Get the link state for the handle/joint
+                    link_state = p.getLinkState(object_id, handle_joint_id, physicsClientId=env.id)
+                    handle_pos = np.array(link_state[0])  # World position of link frame
+                    
+                    distance = np.linalg.norm(handle_pos - robot_eef_pos)
+                    if near_distance < distance < far_distance:
+                        robot_good = True
+                        good_init_found = True
+                        break
+                except Exception:
+                    # If we can't get handle position, just accept the configuration
+                    robot_good = True
+                    break
+            else:
+                # No handle joint, just accept the configuration
+                robot_good = True
+                break
+        
+        if good_init_found:
+            break
+    
+    if not good_init_found:
+        print(f"Warning: Could not find collision-free state after {max_attempts} attempts. Using last configuration.")
+    
+    # 4. Randomize gripper opening
+    if hasattr(env.robot, 'finger_fully_close_joint_angle') and hasattr(env.robot, 'finger_fully_open_joint_angle'):
+        initial_finger_angle = np.random.uniform(
+            env.robot.finger_fully_close_joint_angle, 
+            env.robot.finger_fully_open_joint_angle
+        )
+        env.robot.set_gripper_open_position(
+            env.robot.right_gripper_indices, 
+            [initial_finger_angle, initial_finger_angle], 
+            set_instantly=True
+        )
+    
+    # Final settlement
+    for _ in range(10):
+        p.stepSimulation(physicsClientId=env.id)
+    
+    return env, save_config
+
 def parse_center(center):
     """
     Parse a center coordinate string into a numpy array.
@@ -294,16 +625,20 @@ def parse_config(config, obj_id=None, use_vhacd=True, default_initial_joint_angl
             urdf_movables.append(True) # all mesh objects are movable
            
         elif obj['type'] == 'urdf':
-            try:
-                category = obj['lang']
-                possible_obj_path = partnet_mobility_dict[category]
-            except:
-                category = obj['name']
-                if category == 'Computer display':
-                    category = 'Display'
-                possible_obj_path = partnet_mobility_dict[category]
-            
-            if 'reward_asset_path' not in obj.keys():
+            # Check if reward_asset_path is provided (skip category lookup for custom objects)
+            if 'reward_asset_path' in obj.keys():
+                obj_path = obj['reward_asset_path']
+            else:
+                # Look up in PartNet-Mobility dictionary
+                try:
+                    category = obj['lang']
+                    possible_obj_path = partnet_mobility_dict[category]
+                except:
+                    category = obj['name']
+                    if category == 'Computer display':
+                        category = 'Display'
+                    possible_obj_path = partnet_mobility_dict[category]
+                
                 obj_path = np.random.choice(possible_obj_path)
                 if category == 'Toaster':
                     obj_path = str(103486)
@@ -313,18 +648,46 @@ def parse_config(config, obj_id=None, use_vhacd=True, default_initial_joint_angl
                     obj_path = str(101808)
                 if category == 'Refrigerator':
                     obj_path = str(10638)
-            else:
-                obj_path = obj['reward_asset_path']
+            
+            # Check if this is a custom object path (contains custom_objects)
+            if 'custom_objects' in obj_path or osp.isabs(obj_path):
+                # Handle custom object paths
+                if osp.isabs(obj_path):
+                    base_path = obj_path
+                else:
+                    base_path = osp.join(f"{data_dir}", obj_path)
                 
-
-            urdf_file_path = osp.join(f"{data_dir}/dataset", obj_path, "mobility.urdf")
-            if use_vhacd:
-                new_urdf_file_path = urdf_file_path.replace("mobility.urdf", "mobility_vhacd.urdf")
-                if not osp.exists(new_urdf_file_path):
-                    new_urdf_file_path = preprocess_urdf(urdf_file_path)
-                urdf_paths.append(new_urdf_file_path)
-            else:
+                # Try different URDF filenames
+                possible_urdf_names = ['mobility.urdf', 'mobility_vhacd.urdf']
+                # Also try using the folder name as URDF name
+                folder_name = osp.basename(obj_path).replace('_v2', '').replace('_v1', '')
+                possible_urdf_names.extend([f'{folder_name}.urdf', f'{folder_name}_vhacd.urdf'])
+                
+                urdf_file_path = None
+                for urdf_name in possible_urdf_names:
+                    test_path = osp.join(base_path, urdf_name)
+                    if osp.exists(test_path):
+                        urdf_file_path = test_path
+                        break
+                
+                if urdf_file_path is None:
+                    # If no match found, raise error with helpful message
+                    raise FileNotFoundError(
+                        f"No URDF file found in {base_path}. "
+                        f"Tried: {possible_urdf_names}"
+                    )
+                
                 urdf_paths.append(urdf_file_path)
+            else:
+                # Standard PartNet-Mobility path
+                urdf_file_path = osp.join(f"{data_dir}/dataset", obj_path, "mobility.urdf")
+                if use_vhacd:
+                    new_urdf_file_path = urdf_file_path.replace("mobility.urdf", "mobility_vhacd.urdf")
+                    if not osp.exists(new_urdf_file_path):
+                        new_urdf_file_path = preprocess_urdf(urdf_file_path)
+                    urdf_paths.append(new_urdf_file_path)
+                else:
+                    urdf_paths.append(urdf_file_path)
 
             urdf_types.append('urdf')
             urdf_movables.append(obj.get('movable', False)) # by default, urdf objects are not movable, unless specified

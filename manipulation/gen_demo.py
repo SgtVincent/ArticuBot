@@ -238,13 +238,47 @@ def _gen_init_state(q, config_path, env_name, render, far_distance=0.7, near_dis
     return True
 
 # handle memory leak             
-def gen_init_state(config_path, env_name, render, far_distance=0.7, near_distance=0.3, ):
-    q = mp.Queue()  
-    p = mp.Process(target=_gen_init_state, args=(q, config_path, env_name, render, far_distance, near_distance))
-    p.start()
-    p.join()
-    success = q.get()
-    return success
+def gen_init_state(config_path, env_name, render, far_distance=0.7, near_distance=0.3, timeout: float = 60.0):
+    """Generate an initial state in a separate process with timeout protection.
+
+    This wraps the existing `_gen_init_state` worker in a subprocess and waits
+    up to `timeout` seconds for it to finish. If the worker exceeds the
+    timeout, it is terminated and the function returns False to indicate
+    failure. This prevents the main script from hanging indefinitely.
+
+    Args:
+        config_path (str): Path to the task config YAML.
+        env_name (str): Environment name (e.g., 'articulated').
+        render (bool|int): Whether to enable rendering in the worker.
+        far_distance (float): Max distance threshold for EEF positioning.
+        near_distance (float): Min distance threshold for EEF positioning.
+        timeout (float): Maximum time in seconds to wait for the worker.
+
+    Returns:
+        bool: True if initialization succeeded, False otherwise.
+    """
+    q = mp.Queue()
+    proc = mp.Process(target=_gen_init_state, args=(q, config_path, env_name, render, far_distance, near_distance))
+    proc.start()
+    proc.join(timeout)
+    if proc.is_alive():
+        # Worker exceeded timeout, terminate and return failure
+        print(f"_gen_init_state exceeded timeout ({timeout}s). Terminating worker.")
+        proc.terminate()
+        proc.join()
+        try:
+            success = q.get_nowait()
+        except Exception:
+            success = False
+        return success
+    else:
+        try:
+            # Small timeout so we don't block indefinitely if the worker failed to
+            # put a result on the queue.
+            success = q.get(timeout=1)
+        except Exception:
+            success = False
+        return success
 
 def _execute(q, config_path, env_name, solution_path, experiment_path, time_string=None):
     # get time string
@@ -285,13 +319,43 @@ def _execute(q, config_path, env_name, solution_path, experiment_path, time_stri
         return False
     
 # handle memory leak
-def execute(config_path, env_name, solution_path, experiment_path):
-    q = mp.Queue()  
-    p = mp.Process(target=_execute, args=(q, config_path, env_name, solution_path, experiment_path, None))
-    p.start()
-    p.join()
-    success = q.get()
-    return success
+def execute(config_path, env_name, solution_path, experiment_path, timeout: float = 300.0):
+    """Run the demo execution in a separate process with timeout protection.
+
+    This wraps `_execute` in a subprocess and ensures the main script
+    continues if the worker stalls by enforcing a `timeout`. If the worker is
+    still alive after the timeout it will be terminated and the function will
+    return False.
+
+    Args:
+        config_path (str): Path to the task config YAML.
+        env_name (str): Environment name.
+        solution_path (str): Path where solutions/experiments are stored.
+        experiment_path (str): Base experiment directory path.
+        timeout (float): Maximum time in seconds to wait for the worker.
+
+    Returns:
+        bool: True if execution produced a valid trajectory, False otherwise.
+    """
+    q = mp.Queue()
+    proc = mp.Process(target=_execute, args=(q, config_path, env_name, solution_path, experiment_path, None))
+    proc.start()
+    proc.join(timeout)
+    if proc.is_alive():
+        print(f"_execute exceeded timeout ({timeout}s). Terminating worker.")
+        proc.terminate()
+        proc.join()
+        try:
+            success = q.get_nowait()
+        except Exception:
+            success = False
+        return success
+    else:
+        try:
+            success = q.get(timeout=1)
+        except Exception:
+            success = False
+        return success
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate demos.")
