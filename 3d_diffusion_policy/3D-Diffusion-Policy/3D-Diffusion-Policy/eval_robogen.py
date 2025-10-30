@@ -338,6 +338,8 @@ if __name__ == "__main__":
     parser.add_argument("--randomize_camera", type=int, default=0)
     parser.add_argument("--real_world_camera", type=int, default=0)
     parser.add_argument('--add_one_hot_encoding', type=int, default=0)
+    # parser.add_argument('--observation_mode', type=str, default='act3d_goal_displacement_gripper_to_object')
+    parser.add_argument('--observation_mode', type=str, default='act3d_displacement_gripper_to_object')
     args = parser.parse_args()
     
     ### load low-level policy
@@ -400,8 +402,8 @@ if __name__ == "__main__":
     with open("{}/checkpoint_info.json".format(save_path), "w") as f:
         json.dump(checkpoint_info, f, indent=4)
     
-    cfg.task.env_runner.observation_mode = "act3d_goal_displacement_gripper_to_object"
-    cfg.task.dataset.observation_mode = "act3d_goal_displacement_gripper_to_object"
+    cfg.task.env_runner.observation_mode = args.observation_mode
+    cfg.task.dataset.observation_mode = args.observation_mode
     run_eval_non_parallel(
             cfg, low_level_policy, high_level_policy,
             save_path, 

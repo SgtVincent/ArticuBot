@@ -2,7 +2,7 @@
 """
 Test script for custom URDF model WITHOUT accessing privileged information.
 This script demonstrates how to:
-1. Load a custom URDF model using build_up_env_random
+1. Load a custom URDF model using build_up_env_random or curated eval states
 2. Run the pretrained policy for manipulation
 3. Evaluate results without calling _get_info() which requires mobility_v2.json
 
@@ -16,6 +16,7 @@ import numpy as np
 import argparse
 import torch
 import hydra
+import yaml
 from copy import deepcopy
 from omegaconf import OmegaConf
 import pybullet as p
@@ -29,7 +30,7 @@ from manipulation.robogen_wrapper import RobogenPointCloudWrapper
 from diffusion_policy_3d.gym_util.multistep_wrapper import MultiStepWrapper
 from train_ddp import TrainDP3Workspace
 from diffusion_policy_3d.common.pytorch_util import dict_apply
-from manipulation.utils import build_up_env_random, save_numpy_as_gif
+from manipulation.utils import build_up_env_random, build_up_env_eval, save_numpy_as_gif
 
 
 class RobogenPointCloudWrapperNoInfo(RobogenPointCloudWrapper):
@@ -38,16 +39,43 @@ class RobogenPointCloudWrapperNoInfo(RobogenPointCloudWrapper):
     This allows testing custom objects without mobility_v2.json files.
     """
     
+    def __init__(self, *args, **kwargs):
+        """Initialize and store whether we should preserve randomization."""
+        super().__init__(*args, **kwargs)
+        self._preserve_initial_state = False
+        self._initial_state_saved = None
+    
+    def set_preserve_initial_state(self, preserve=True):
+        """Set whether to preserve the current state on reset (for randomization)."""
+        self._preserve_initial_state = preserve
+        if preserve:
+            # Save the current state
+            from manipulation.utils import save_env
+            self._initial_state_saved = save_env(self._env, save_path=None, simplified=False)
+    
     def reset(self, **kwargs):
         """Reset without calling _get_info()."""
         if "act3d_goal" in self.observation_mode:
             self.grasped_handle = False
-        self._env.reset(**kwargs)
+        
+        # If we should preserve initial state (randomization), restore it instead of resetting
+        if self._preserve_initial_state and self._initial_state_saved is not None:
+            from manipulation.utils import load_env
+            load_env(self._env, state=self._initial_state_saved, simplified=False)
+        else:
+            self._env.reset(**kwargs)
+        
         # SKIP: self._env._get_info()  # This requires mobility_v2.json
         self.time_step = 0
         if "goal" in self.observation_mode:
             self.grasped_handle = False
         return self._get_observation(only_object=self.only_object)
+    
+    def _get_observation(self, render=True, only_object=True):
+        """Get observation - parent class handles displacement features."""
+        # Parent class automatically adds displacement features when
+        # observation_mode contains 'displacement_gripper_to_object'
+        return super()._get_observation(render=render, only_object=only_object)
     
     def step(self, action, **kwargs):
         """Step without calling _get_info()."""
@@ -141,7 +169,9 @@ def load_policies(low_level_exp_dir, low_level_ckpt_name, high_level_ckpt_path, 
     return cfg, low_level_policy, high_level_policy
 
 
-def construct_custom_env(cfg, config_file, num_points=1280, randomize=True):
+def construct_custom_env(cfg, config_file, num_points=4500, randomize=True,
+                         draw_coordinate_frame=False, use_eval_states=False,
+                         eval_experiment_name=None, eval_trial_index=0):
     """Construct environment for the custom URDF model with random initialization.
     
     This version does NOT call _get_info() to avoid accessing privileged information
@@ -152,6 +182,10 @@ def construct_custom_env(cfg, config_file, num_points=1280, randomize=True):
         config_file (str): Path to the task-specific config file.
         num_points (int): Number of points in point cloud.
         randomize (bool): If True, randomly initialize object pose, robot joints, etc.
+        draw_coordinate_frame (bool): If True, draw world coordinate frame in rendering.
+        use_eval_states (bool): If True, load curated evaluation states instead of random resets.
+        eval_experiment_name (str): Optional experiment folder to use when loading eval states.
+        eval_trial_index (int): Trial index within the experiment to select for eval states.
     
     Returns:
         A MultiStepWrapper-wrapped environment ready for evaluation.
@@ -162,40 +196,154 @@ def construct_custom_env(cfg, config_file, num_points=1280, randomize=True):
     print("=" * 60)
     print(f"Config file: {config_file}")
     print(f"Randomize initialization: {randomize}")
+    print(f"Use evaluation states: {use_eval_states}")
     
-    # Build the base environment with random initialization
-    if randomize:
-        env, task_config = build_up_env_random(
-            task_config=config_file,
-            env_name='articulated',
+    if use_eval_states:
+        print("✓ Using curated evaluation states")
+
+        with open(config_file, 'r') as f:
+            config_entries = yaml.safe_load(f)
+
+        solution_path_candidates = [entry['solution_path'] for entry in config_entries if 'solution_path' in entry]
+        if len(solution_path_candidates) == 0:
+            raise ValueError("Config file does not contain a solution_path entry required for evaluation states.")
+        solution_path = solution_path_candidates[0]
+
+        object_name_candidates = [entry['name'] for entry in config_entries if 'name' in entry]
+        if len(object_name_candidates) == 0:
+            raise ValueError("Config file does not specify object name.")
+        object_name = object_name_candidates[0].lower()
+
+        project_dir = os.environ['PROJECT_DIR']
+        substeps_path = os.path.join(project_dir, solution_path, 'substeps.txt')
+        if not os.path.exists(substeps_path):
+            raise FileNotFoundError(f"substeps.txt not found at {substeps_path}")
+
+        with open(substeps_path, 'r') as f:
+            substeps = [line.strip() for line in f if line.strip()]
+        if len(substeps) == 0:
+            raise ValueError("substeps.txt is empty, cannot determine task name.")
+        first_step = substeps[0]
+        task_name = first_step.replace(' ', '_')
+
+        experiment_root = os.path.join(project_dir, solution_path, 'experiment')
+        if not os.path.isdir(experiment_root):
+            raise FileNotFoundError(f"Experiment directory not found at {experiment_root}")
+
+        experiment_names = sorted([
+            name for name in os.listdir(experiment_root)
+            if os.path.isdir(os.path.join(experiment_root, name))
+        ])
+        if len(experiment_names) == 0:
+            raise ValueError(f"No experiments found in {experiment_root}")
+
+        if eval_experiment_name is not None:
+            if eval_experiment_name not in experiment_names:
+                raise ValueError(
+                    f"Requested experiment '{eval_experiment_name}' not found. Available: {experiment_names}"
+                )
+            selected_experiment = eval_experiment_name
+        else:
+            selected_experiment = experiment_names[0]
+
+        experiment_dir = os.path.join(experiment_root, selected_experiment)
+        print(f"✓ Selected experiment: {selected_experiment}")
+        trial_dirs = sorted([
+            name for name in os.listdir(experiment_dir)
+            if os.path.isdir(os.path.join(experiment_dir, name))
+        ])
+        if len(trial_dirs) == 0:
+            raise ValueError(f"No trial directories found in {experiment_dir}")
+
+        if eval_trial_index < 0 or eval_trial_index >= len(trial_dirs):
+            raise IndexError(
+                f"Trial index {eval_trial_index} is out of range for {len(trial_dirs)} available trials"
+            )
+
+        selected_trial = trial_dirs[eval_trial_index]
+        trial_dir = os.path.join(experiment_dir, selected_trial)
+        print(f"✓ Selected trial [{eval_trial_index}]: {selected_trial}")
+
+        task_config_path = os.path.join(trial_dir, 'task_config.yaml')
+        if not os.path.exists(task_config_path):
+            raise FileNotFoundError(f"task_config.yaml not found in {trial_dir}")
+
+        primitive_folder = os.path.join(trial_dir, f"{task_name}_primitive")
+        state_dir = os.path.join(primitive_folder, 'states')
+        init_state_file = os.path.join(state_dir, 'state_0.pkl')
+        if not os.path.exists(init_state_file):
+            raise FileNotFoundError(f"Initial state file not found at {init_state_file}")
+
+        state_rel = os.path.relpath(init_state_file, project_dir)
+        print(f"✓ Restoring from state: {state_rel}")
+
+        env, _ = build_up_env_eval(
+            task_config=task_config_path,
+            solution_path=solution_path,
+            task_name=task_name,
+            restore_state_file=init_state_file,
             render=False,
-            randomize_object_pose=True,
-            randomize_robot_joints=True,
-            randomize_initial_joint_angle=True,
             horizon=600,
-            max_attempts=100,
-            far_distance=0.7,
-            near_distance=0.3
         )
-        print(f"✓ Base environment created with random initialization")
+        print(f"✓ Loaded evaluation environment from {selected_trial}")
+        wrapper_cls = RobogenPointCloudWrapper
     else:
-        raise NotImplementedError("Non-random initialization requires pre-stored states. Use randomize=True.")
+        if randomize:
+            env, task_config = build_up_env_random(
+                task_config=config_file,
+                env_name='articulated',
+                render=False,
+                randomize_object_pose=True,
+                randomize_robot_joints=True,
+                randomize_initial_joint_angle=True,
+                horizon=600,
+                max_attempts=100,
+                far_distance=0.7,
+                near_distance=0.3
+            )
+            print(f"✓ Base environment created with random initialization")
+        else:
+            raise NotImplementedError("Non-random initialization requires pre-stored states. Use randomize=True.")
+
+        object_name = task_config['object_name'].lower()
+        wrapper_cls = RobogenPointCloudWrapperNoInfo
     
-    # Get object name from config
-    object_name = task_config['object_name'].lower()
+    # Draw world coordinate frame if requested
+    if draw_coordinate_frame:
+        import pybullet as p
+        # X-axis: Red, Y-axis: Green, Z-axis: Blue
+        p.addUserDebugLine([0, 0, 0], [0.3, 0, 0], [1, 0, 0], lineWidth=3, lifeTime=0, physicsClientId=env.id)
+        p.addUserDebugLine([0, 0, 0], [0, 0.3, 0], [0, 1, 0], lineWidth=3, lifeTime=0, physicsClientId=env.id)
+        p.addUserDebugLine([0, 0, 0], [0, 0, 0.3], [0, 0, 1], lineWidth=3, lifeTime=0, physicsClientId=env.id)
+        print(f"✓ World coordinate frame drawn (X:Red, Y:Green, Z:Blue)")
     
     # Wrap with custom point cloud wrapper that doesn't call _get_info()
-    # Use simpler observation mode that doesn't require goal states or _get_info()
-    pointcloud_env = RobogenPointCloudWrapperNoInfo(
+    # Use 'act3d_displacement_gripper_to_object' mode:
+    # - Avoids expert demo file loading (no 'act3d_goal')
+    # - Provides displacement features needed by the policy
+    pointcloud_env = wrapper_cls(
         env, 
         object_name,
         num_points=num_points,
-        observation_mode="act3d",  # Simple mode without goals
+        observation_mode="act3d_displacement_gripper_to_object",
         real_world_camera=False,
         noise_real_world_pcd=False,
     )
+
+    randomized_state_preserved = False
+    if hasattr(pointcloud_env, 'set_preserve_initial_state'):
+        pointcloud_env.set_preserve_initial_state(preserve=True)
+        randomized_state_preserved = True
     
-    print(f"✓ Point cloud wrapper added (no _get_info() calls)")
+    if isinstance(pointcloud_env, RobogenPointCloudWrapperNoInfo):
+        print(f"✓ Point cloud wrapper added (no _get_info() calls)")
+    else:
+        print(f"✓ Point cloud wrapper added (full info available)")
+
+    if randomized_state_preserved:
+        print(f"✓ Randomized state saved and will be preserved on reset")
+    if use_eval_states:
+        print(f"✓ Environment will reset to curated evaluation state")
     
     # Wrap with multi-step wrapper
     env = MultiStepWrapper(
@@ -237,12 +385,11 @@ def high_level_policy_infer(obs_dict, high_level_policy, output_obj_pcd_only=Tru
         outputs = outputs[:, :, :-1]  # B, N, 12
         
         if output_obj_pcd_only:
-            # Only use object point cloud (exclude gripper points)
-            # Filter both outputs and the corresponding input points
-            num_obj_points = pointcloud.shape[1]
-            outputs = outputs[:, :num_obj_points, :]
-            weights = weights[:, :num_obj_points]
-            inputs_for_residual = inputs[:, :num_obj_points, :3]
+            # Only use object point cloud (exclude last 4 gripper points)
+            # This matches eval_robogen.py filtering logic
+            outputs = outputs[:, :-4, :]  # Remove last 4 gripper points
+            weights = weights[:, :-4]  # Remove last 4 gripper points
+            inputs_for_residual = inputs[:, :-4, :3]  # Remove last 4 gripper points
         else:
             inputs_for_residual = inputs[:, :, :3]
         
@@ -335,7 +482,7 @@ def run_test_rollout(env, object_name, low_level_policy, high_level_policy, hori
             parallel_input_dict[key] = parallel_input_dict[key].unsqueeze(0)
         
         # Infer high-level goal
-        if t % update_goal_freq == 0:
+        if last_goal is None or t % update_goal_freq == 0:
             with torch.no_grad():
                 goal_eef_points = high_level_policy_infer(
                     parallel_input_dict, 
@@ -349,9 +496,10 @@ def run_test_rollout(env, object_name, low_level_policy, high_level_policy, hori
         
         # Add required goal observations for the low-level policy
         # goal_eef_points has shape (B, 1, 4, 3)
-        # We need to expand it to match the time dimension of observations (B, T, 4, 3)
-        T = parallel_input_dict['gripper_pcd'].shape[1]
-        goal_expanded = goal_eef_points.expand(-1, T, -1, -1)  # Expand to (B, T, 4, 3)
+        # Low-level policy expects (B, 2, 4, 3) - matching eval_robogen.py
+        goal_expanded = goal_eef_points.repeat(1, 2, 1, 1)  # Repeat to (B, 2, 4, 3)
+        np_goal = goal_eef_points.detach().to('cpu').numpy()
+        env.env.goal_gripper_pcd = np_goal.squeeze(0)[0]
         
         parallel_input_dict['goal_eef_points'] = goal_expanded
         parallel_input_dict['goal_gripper_pcd'] = goal_expanded  # Use same goal for gripper
@@ -403,8 +551,7 @@ def run_test_rollout(env, object_name, low_level_policy, high_level_policy, hori
     
     return all_rgbs, summary_info
 
-
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description="Test pretrained policy on custom URDF model (no privileged info)")
     parser.add_argument('--low_level_exp_dir', type=str, 
                         default='data/low-level-ckpt',
@@ -415,9 +562,11 @@ def main():
     parser.add_argument('--high_level_ckpt_name', type=str, 
                         default='data/high_level_200_obj_ckpt.pth',
                         help='Path to high-level checkpoint')
+    parser.add_argument('--model', type=str, default='color_0025_0_v2',
+                        help='Model to test: door_40147 or other custom model (e.g., color_0025_0_v2)')
     parser.add_argument('--config_id', type=int, default=500,
-                        help='Config ID to use (500-512)')
-    parser.add_argument('--horizon', type=int, default=35,
+                        help='Config ID to use (for color_0025_0_v2: 500-512; for door_40147: 0-299)')
+    parser.add_argument('--horizon', type=int, default=70,
                         help='Number of steps to run')
     parser.add_argument('--update_goal_freq', type=int, default=1,
                         help='Frequency to update goal')
@@ -431,19 +580,41 @@ def main():
                         help='Number of random trials to run')
     parser.add_argument('--save_gif', type=int, default=1,
                         help='Save evaluation episodes as GIF (1=yes, 0=no)')
+    parser.add_argument('--draw_coordinate_frame', type=int, default=0,
+                        help='Draw world coordinate frame in GIF (1=yes, 0=no)')
+    parser.add_argument('--use_eval_states', type=int, default=0,
+                        help='Use curated evaluation states instead of random initialization (1=yes, 0=no)')
+    parser.add_argument('--eval_experiment_name', type=str, default=None,
+                        help='Optional experiment folder to load when using curated evaluation states')
+    parser.add_argument('--eval_trial_index', type=int, default=0,
+                        help='Zero-based trial index to load when using curated evaluation states')
     
     args = parser.parse_args()
+    return args
+
+def main(args):
+
     
     print("=" * 60)
     print("Testing Custom URDF Model WITHOUT Privileged Information")
     print("=" * 60)
-    print(f"Model: color_0025_0_v2")
+    
+    # Leave one model from Part Mobility Dataset to verify custom loading
+    if args.model == 'door_40147':
+        model_name = 'door_40147'
+        object_path = os.path.join(PROJECT_ROOT, 'data/diverse_objects/open_the_door_40147')
+        config_file = os.path.join(object_path, f'configs/config_{args.config_id}.yaml')
+    else:
+        model_name = args.model
+        object_path = os.path.join(PROJECT_ROOT, 'data/custom_objects/color_0025_0_v2')
+        config_file = os.path.join(object_path, f'configs/config_larger_randomization_{args.config_id}.yaml')
+    
+    print(f"Model: {model_name}")
     print(f"Config ID: {args.config_id}")
     print(f"Number of trials: {args.num_trials}")
     
     # Paths
-    object_path = os.path.join(PROJECT_ROOT, 'data/custom_objects/color_0025_0_v2')
-    config_file = os.path.join(object_path, f'configs/config_larger_randomization_{args.config_id}.yaml')
+    config_file = config_file
     
     if not os.path.exists(config_file):
         print(f"❌ Config file not found: {config_file}")
@@ -468,7 +639,15 @@ def main():
         print(f"{'=' * 60}")
         
         # Construct environment (new random initialization each trial)
-        env, object_name = construct_custom_env(cfg, config_file, randomize=True)
+        env, object_name = construct_custom_env(
+            cfg, 
+            config_file, 
+            randomize=not bool(args.use_eval_states),
+            draw_coordinate_frame=bool(args.draw_coordinate_frame),
+            use_eval_states=bool(args.use_eval_states),
+            eval_experiment_name=args.eval_experiment_name,
+            eval_trial_index=args.eval_trial_index,
+        )
         
         # Run test rollout
         all_rgbs, summary_info = run_test_rollout(
@@ -488,7 +667,7 @@ def main():
         
         # Save GIF if enabled
         if args.save_gif and len(all_rgbs) > 0:
-            gif_path = os.path.join(args.save_dir, f'color_0025_0_v2_config{args.config_id}{trial_suffix}.gif')
+            gif_path = os.path.join(args.save_dir, f'{model_name}_config{args.config_id}{trial_suffix}.gif')
             save_numpy_as_gif(np.array(all_rgbs), gif_path)
             print(f"\n✓ Saved rollout GIF to: {gif_path}")
         elif not args.save_gif:
@@ -496,8 +675,9 @@ def main():
         
         # Save info
         import json
-        info_path = os.path.join(args.save_dir, f'color_0025_0_v2_config{args.config_id}{trial_suffix}_info.json')
+        info_path = os.path.join(args.save_dir, f'{model_name}_config{args.config_id}{trial_suffix}_info.json')
         info_dict = {
+            "model": model_name,
             "config_id": args.config_id,
             "trial": trial,
             "initial_joints": summary_info['initial_joints'],
@@ -536,4 +716,45 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    
+    ###################################
+    # Run for door_40147 with eval states loaded
+    ###################################
+    ## Override parsed args to match the requested command:
+    # args.model = 'door_40147'
+    # args.config_id = 0
+    # args.horizon = 35
+    # args.save_gif = 1
+    # # args.draw_coordinate_frame = 1
+    # args.num_trials = 5
+    # args.save_dir = 'data/test_custom_model/act3d_displacement_gripper_to_object'
+    # args.use_eval_states = 1
+    # args.eval_experiment_name = "0705-diverse-objects-vary-obj-loc-ori-init-angle-robot-init-joint-near-handle-300-demo-0.4-0.15-translation-first"
+    
+    ###################################
+    # Run for door_40147 with random initialization
+    ###################################
+    # Override parsed args to match the requested command:
+    # args.model = 'door_40147'
+    # args.config_id = 0
+    # args.horizon = 35
+    # args.save_gif = 1
+    # # args.draw_coordinate_frame = 1
+    # args.num_trials = 5
+    # args.save_dir = 'data/test_custom_model/act3d_displacement_gripper_to_object'
+    # args.use_eval_states = 0
+    
+    ################################
+    # Run for color_0025_0_v2 with random initialization
+    ################################
+    args.model = 'color_0025_0_v2'
+    args.config_id = 500
+    args.horizon = 70
+    args.save_gif = 1
+    # args.draw_coordinate_frame = 1
+    args.num_trials = 5
+    args.save_dir = 'data/test_custom_model/act3d_displacement_gripper_to_object'
+
+    main(args)
+    
