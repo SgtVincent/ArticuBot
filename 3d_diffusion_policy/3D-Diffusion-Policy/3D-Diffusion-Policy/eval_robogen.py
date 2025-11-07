@@ -338,8 +338,8 @@ if __name__ == "__main__":
     parser.add_argument("--randomize_camera", type=int, default=0)
     parser.add_argument("--real_world_camera", type=int, default=0)
     parser.add_argument('--add_one_hot_encoding', type=int, default=0)
-    # parser.add_argument('--observation_mode', type=str, default='act3d_goal_displacement_gripper_to_object')
-    parser.add_argument('--observation_mode', type=str, default='act3d_displacement_gripper_to_object')
+    parser.add_argument('--observation_mode', type=str, default='act3d_goal_displacement_gripper_to_object')
+    # parser.add_argument('--observation_mode', type=str, default='act3d_displacement_gripper_to_object')
     args = parser.parse_args()
     
     ### load low-level policy

@@ -40,10 +40,35 @@ class RobogenPointCloudWrapperNoInfo(RobogenPointCloudWrapper):
     """
     
     def __init__(self, *args, **kwargs):
-        """Initialize and store whether we should preserve randomization."""
+        """Initialize and store whether we should preserve randomization.
+        
+        Temporarily sets observation_mode to avoid goal file loading,
+        then restores it after initialization.
+        """
+        # Extract observation_mode before calling parent
+        observation_mode = kwargs.get('observation_mode', 'act3d_displacement_gripper_to_object')
+        
+        # Temporarily replace observation_mode to prevent parent from loading goal files
+        original_mode = observation_mode
+        if 'goal' in observation_mode:
+            # Use a mode without 'goal' to skip file loading in parent __init__
+            kwargs['observation_mode'] = 'act3d_displacement_gripper_to_object'
+        
         super().__init__(*args, **kwargs)
+        
+        # Restore the original observation mode
+        self.observation_mode = original_mode
+        
         self._preserve_initial_state = False
         self._initial_state_saved = None
+        
+        # Initialize goal placeholders when goal observation mode is requested
+        if "goal" in self.observation_mode:
+            # Initialize zero-valued goal arrays to avoid calling _get_info()
+            self.goal_gripper_pcd = np.zeros((4, 3), dtype=np.float32)
+            self.grasping_goal = np.zeros((4, 3), dtype=np.float32)
+            self.final_goal = np.zeros((4, 3), dtype=np.float32)
+            self.grasped_handle = False
     
     def set_preserve_initial_state(self, preserve=True):
         """Set whether to preserve the current state on reset (for randomization)."""
@@ -171,7 +196,8 @@ def load_policies(low_level_exp_dir, low_level_ckpt_name, high_level_ckpt_path, 
 
 def construct_custom_env(cfg, config_file, num_points=4500, randomize=True,
                          draw_coordinate_frame=False, use_eval_states=False,
-                         eval_experiment_name=None, eval_trial_index=0):
+                         eval_experiment_name=None, eval_trial_index=0,
+                         observation_mode="act3d_displacement_gripper_to_object"):
     """Construct environment for the custom URDF model with random initialization.
     
     This version does NOT call _get_info() to avoid accessing privileged information
@@ -186,6 +212,7 @@ def construct_custom_env(cfg, config_file, num_points=4500, randomize=True,
         use_eval_states (bool): If True, load curated evaluation states instead of random resets.
         eval_experiment_name (str): Optional experiment folder to use when loading eval states.
         eval_trial_index (int): Trial index within the experiment to select for eval states.
+        observation_mode (str): Observation mode to use for the point cloud wrapper.
     
     Returns:
         A MultiStepWrapper-wrapped environment ready for evaluation.
@@ -197,6 +224,7 @@ def construct_custom_env(cfg, config_file, num_points=4500, randomize=True,
     print(f"Config file: {config_file}")
     print(f"Randomize initialization: {randomize}")
     print(f"Use evaluation states: {use_eval_states}")
+    print(f"Observation mode: {observation_mode}")
     
     if use_eval_states:
         print("✓ Using curated evaluation states")
@@ -293,8 +321,10 @@ def construct_custom_env(cfg, config_file, num_points=4500, randomize=True,
                 task_config=config_file,
                 env_name='articulated',
                 render=False,
-                randomize_object_pose=True,
-                randomize_robot_joints=True,
+                # randomize_object_pose=True,
+                randomize_object_pose=False,
+                # randomize_robot_joints=True,
+                randomize_robot_joints=False,
                 randomize_initial_joint_angle=True,
                 horizon=600,
                 max_attempts=100,
@@ -318,14 +348,11 @@ def construct_custom_env(cfg, config_file, num_points=4500, randomize=True,
         print(f"✓ World coordinate frame drawn (X:Red, Y:Green, Z:Blue)")
     
     # Wrap with custom point cloud wrapper that doesn't call _get_info()
-    # Use 'act3d_displacement_gripper_to_object' mode:
-    # - Avoids expert demo file loading (no 'act3d_goal')
-    # - Provides displacement features needed by the policy
     pointcloud_env = wrapper_cls(
         env, 
         object_name,
         num_points=num_points,
-        observation_mode="act3d_displacement_gripper_to_object",
+        observation_mode=observation_mode,
         real_world_camera=False,
         noise_real_world_pcd=False,
     )
@@ -339,6 +366,7 @@ def construct_custom_env(cfg, config_file, num_points=4500, randomize=True,
         print(f"✓ Point cloud wrapper added (no _get_info() calls)")
     else:
         print(f"✓ Point cloud wrapper added (full info available)")
+    print(f"✓ Observation mode set to '{observation_mode}'")
 
     if randomized_state_preserved:
         print(f"✓ Randomized state saved and will be preserved on reset")
@@ -499,7 +527,6 @@ def run_test_rollout(env, object_name, low_level_policy, high_level_policy, hori
         # Low-level policy expects (B, 2, 4, 3) - matching eval_robogen.py
         goal_expanded = goal_eef_points.repeat(1, 2, 1, 1)  # Repeat to (B, 2, 4, 3)
         np_goal = goal_eef_points.detach().to('cpu').numpy()
-        env.env.goal_gripper_pcd = np_goal.squeeze(0)[0]
         
         parallel_input_dict['goal_eef_points'] = goal_expanded
         parallel_input_dict['goal_gripper_pcd'] = goal_expanded  # Use same goal for gripper
@@ -511,6 +538,10 @@ def run_test_rollout(env, object_name, low_level_policy, high_level_policy, hori
         
         # Execute action (render=True is already passed by MultiStepWrapper)
         obs, reward, done, info = env.step(action)
+        
+        # Update goal visualization AFTER stepping (matching eval_robogen.py order)
+        env.env.goal_gripper_pcd = np_goal.squeeze(0)[0]
+        
         if save_gif:
             rgb = env.env.render()
             all_rgbs.append(rgb)
@@ -588,6 +619,9 @@ def parse_args():
                         help='Optional experiment folder to load when using curated evaluation states')
     parser.add_argument('--eval_trial_index', type=int, default=0,
                         help='Zero-based trial index to load when using curated evaluation states')
+    parser.add_argument('--observation_mode', type=str,
+                        default='act3d_displacement_gripper_to_object',
+                        help='Observation mode passed to RobogenPointCloudWrapper')
     
     args = parser.parse_args()
     return args
@@ -612,6 +646,7 @@ def main(args):
     print(f"Model: {model_name}")
     print(f"Config ID: {args.config_id}")
     print(f"Number of trials: {args.num_trials}")
+    print(f"Observation mode: {args.observation_mode}")
     
     # Paths
     config_file = config_file
@@ -647,6 +682,7 @@ def main(args):
             use_eval_states=bool(args.use_eval_states),
             eval_experiment_name=args.eval_experiment_name,
             eval_trial_index=args.eval_trial_index,
+            observation_mode=args.observation_mode,
         )
         
         # Run test rollout
@@ -721,40 +757,41 @@ if __name__ == "__main__":
     ###################################
     # Run for door_40147 with eval states loaded
     ###################################
-    ## Override parsed args to match the requested command:
     # args.model = 'door_40147'
     # args.config_id = 0
     # args.horizon = 35
     # args.save_gif = 1
     # # args.draw_coordinate_frame = 1
     # args.num_trials = 5
-    # args.save_dir = 'data/test_custom_model/act3d_displacement_gripper_to_object'
+    # args.save_dir = 'data/test_custom_model/act3d_goal_displacement_gripper_to_object_curated_state'
     # args.use_eval_states = 1
     # args.eval_experiment_name = "0705-diverse-objects-vary-obj-loc-ori-init-angle-robot-init-joint-near-handle-300-demo-0.4-0.15-translation-first"
+    # args.observation_mode = 'act3d_goal_displacement_gripper_to_object'
     
     ###################################
     # Run for door_40147 with random initialization
     ###################################
-    # Override parsed args to match the requested command:
-    # args.model = 'door_40147'
-    # args.config_id = 0
+    args.model = 'door_40147'
+    args.config_id = 0
+    args.horizon = 35
+    args.save_gif = 1
+    # args.draw_coordinate_frame = 1
+    args.num_trials = 5
+    args.save_dir = 'data/test_custom_model/act3d_goal_displacement_gripper_to_object_no_random'
+    args.use_eval_states = 0
+    args.observation_mode = 'act3d_goal_displacement_gripper_to_object'
+
+    #######################
+    # Run for color_0025_0_v2 with random initialization
+    #######################
+    # args.model = 'color_0025_0_v2'
+    # args.config_id = 500
     # args.horizon = 35
     # args.save_gif = 1
     # # args.draw_coordinate_frame = 1
     # args.num_trials = 5
-    # args.save_dir = 'data/test_custom_model/act3d_displacement_gripper_to_object'
-    # args.use_eval_states = 0
-    
-    ################################
-    # Run for color_0025_0_v2 with random initialization
-    ################################
-    args.model = 'color_0025_0_v2'
-    args.config_id = 500
-    args.horizon = 70
-    args.save_gif = 1
-    # args.draw_coordinate_frame = 1
-    args.num_trials = 5
-    args.save_dir = 'data/test_custom_model/act3d_displacement_gripper_to_object'
+    # args.save_dir = 'data/test_custom_model/act3d_goal_displacement_gripper_to_object'
+    # args.observation_mode = 'act3d_goal_displacement_gripper_to_object'
 
     main(args)
     
