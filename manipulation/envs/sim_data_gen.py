@@ -5,7 +5,7 @@ import numpy as np
 import open3d as o3d
 import pybullet as p
 
-from manipulation.sim_base import SimpleEnvBase
+from manipulation.envs.sim_base import SimpleEnvBase
 from manipulation.utils import get_pc
 
 

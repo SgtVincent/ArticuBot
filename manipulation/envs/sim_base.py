@@ -80,7 +80,9 @@ class SimpleEnvBase(gym.Env):
         else:
             self.id = p.connect(p.DIRECT)
 
-        self.asset_dir = osp.join(osp.dirname(osp.realpath(__file__)), "assets/")
+        # self.asset_dir = osp.join(osp.dirname(osp.realpath(__file__)), "assets/")
+        # Point to ../assets relative to this file (manipulation/envs/sim_base.py -> manipulation/assets)
+        self.asset_dir = osp.join(osp.dirname(osp.dirname(osp.realpath(__file__))), "assets/")
         p.setTimeStep(dt, physicsClientId=self.id)
 
         self.init_state = None

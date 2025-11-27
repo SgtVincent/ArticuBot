@@ -57,12 +57,18 @@ def extract_handle_mesh(obj_id):
     render(data, cur_shape_dir)
 
 def create_config_variant(config_path):
-    config_variant_paths = os.path.join("/".join(config_path.split("/")[:-1]), "configs")
+    # Use the same directory as the config file for variants, or a 'configs' subdirectory if it exists
+    config_dir = os.path.dirname(config_path)
+    config_variant_paths = os.path.join(config_dir, "configs")
     if not os.path.exists(config_variant_paths):
         os.makedirs(config_variant_paths)
 
     # create config variant
-    new_config_path = os.path.join(config_variant_paths, f"config_larger_randomization_{try_times+500}.yaml")
+    # We need try_times here, but it's not passed in. 
+    # Assuming this function is called within a loop where try_times is available or we use a random/timestamp suffix.
+    # Since try_times is not available in this scope, let's use a timestamp or random number.
+    suffix = int(time.time() * 1000)
+    new_config_path = os.path.join(config_variant_paths, f"config_larger_randomization_{suffix}.yaml")
         
     base_config = yaml.safe_load(open(config_path, "r"))
     new_config = copy.deepcopy(base_config)

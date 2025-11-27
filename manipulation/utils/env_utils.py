@@ -1,18 +1,23 @@
 import copy
 import importlib
+import json
 import os
 import os.path as osp
 import pickle
+from pathlib import Path
+
+from typing import List, Optional
 
 import numpy as np
 import pybullet as p
 import yaml
 from objaverse_utils.utils import partnet_mobility_dict
-from typing import Optional, List
+from scipy import ndimage
 
 from .defaults import default_config, data_dir
+from .geometry_utils import get_pc, in_bbox, sample_point_inside_triangle
+from .handle_utiils import find_nearest_point_on_line, load_obj, rotate_point_around_axis
 from .object_utils import down_load_single_object, preprocess_urdf
-
 
 
 def build_up_env_eval(task_config=None, solution_path=None, task_name=None, restore_state_file=None, return_env_class=False, 
@@ -590,7 +595,10 @@ def parse_config(config, obj_id=None, use_vhacd=True, default_initial_joint_angl
             
 
         if "type" not in obj.keys():
-            continue
+            if "urdf_path" in obj.keys():
+                obj['type'] = 'urdf'
+            else:
+                continue
         
         if obj['type'] == 'mesh':
             if 'uid' not in obj.keys():
@@ -625,69 +633,46 @@ def parse_config(config, obj_id=None, use_vhacd=True, default_initial_joint_angl
             urdf_movables.append(True) # all mesh objects are movable
            
         elif obj['type'] == 'urdf':
-            # Check if reward_asset_path is provided (skip category lookup for custom objects)
-            if 'reward_asset_path' in obj.keys():
-                obj_path = obj['reward_asset_path']
+            if 'urdf_path' in obj.keys():
+                urdf_paths.append(obj['urdf_path'])
             else:
-                # Look up in PartNet-Mobility dictionary
-                try:
-                    category = obj['lang']
-                    possible_obj_path = partnet_mobility_dict[category]
-                except:
-                    category = obj['name']
-                    if category == 'Computer display':
-                        category = 'Display'
-                    possible_obj_path = partnet_mobility_dict[category]
-                
-                obj_path = np.random.choice(possible_obj_path)
-                if category == 'Toaster':
-                    obj_path = str(103486)
-                if category == 'Microwave':
-                    obj_path = str(7310)
-                if category == "Oven":
-                    obj_path = str(101808)
-                if category == 'Refrigerator':
-                    obj_path = str(10638)
-            
-            # Check if this is a custom object path (contains custom_objects)
-            if 'custom_objects' in obj_path or osp.isabs(obj_path):
-                # Handle custom object paths
-                if osp.isabs(obj_path):
-                    base_path = obj_path
+                if 'reward_asset_path' in obj.keys():
+                    obj_path = obj['reward_asset_path']
                 else:
-                    base_path = osp.join(f"{data_dir}", obj_path)
+                    try:
+                        category = obj['lang']
+                        possible_obj_path = partnet_mobility_dict[category]
+                    except:
+                        category = obj['name']
+                        if category == 'Computer display':
+                            category = 'Display'
+                        possible_obj_path = partnet_mobility_dict[category]
+                    
+                    obj_path = np.random.choice(possible_obj_path)
+                    if category == 'Toaster':
+                        obj_path = str(103486)
+                    if category == 'Microwave':
+                        obj_path = str(7310)
+                    if category == "Oven":
+                        obj_path = str(101808)
+                    if category == 'Refrigerator':
+                        obj_path = str(10638)
                 
-                # Try different URDF filenames
-                possible_urdf_names = ['mobility.urdf', 'mobility_vhacd.urdf']
-                # Also try using the folder name as URDF name
-                folder_name = osp.basename(obj_path).replace('_v2', '').replace('_v1', '')
-                possible_urdf_names.extend([f'{folder_name}.urdf', f'{folder_name}_vhacd.urdf'])
-                
-                urdf_file_path = None
-                for urdf_name in possible_urdf_names:
-                    test_path = osp.join(base_path, urdf_name)
-                    if osp.exists(test_path):
-                        urdf_file_path = test_path
-                        break
-                
-                if urdf_file_path is None:
-                    # If no match found, raise error with helpful message
-                    raise FileNotFoundError(
-                        f"No URDF file found in {base_path}. "
-                        f"Tried: {possible_urdf_names}"
-                    )
-                
-                urdf_paths.append(urdf_file_path)
-            else:
-                # Standard PartNet-Mobility path
-                urdf_file_path = osp.join(f"{data_dir}/dataset", obj_path, "mobility.urdf")
-                if use_vhacd:
-                    new_urdf_file_path = urdf_file_path.replace("mobility.urdf", "mobility_vhacd.urdf")
-                    if not osp.exists(new_urdf_file_path):
-                        new_urdf_file_path = preprocess_urdf(urdf_file_path)
-                    urdf_paths.append(new_urdf_file_path)
-                else:
+                if 'custom_objects' in obj_path or osp.isabs(obj_path):
+                    if osp.isabs(obj_path):
+                        urdf_file_path = osp.join(obj_path, "mobility.urdf")
+                    else:
+                        urdf_file_path = osp.join(f"{data_dir}", obj_path, "mobility.urdf")
                     urdf_paths.append(urdf_file_path)
+                else:
+                    urdf_file_path = osp.join(f"{data_dir}/dataset", obj_path, "mobility.urdf")
+                    if use_vhacd:
+                        new_urdf_file_path = urdf_file_path.replace("mobility.urdf", "mobility_vhacd.urdf")
+                        if not osp.exists(new_urdf_file_path):
+                            new_urdf_file_path = preprocess_urdf(urdf_file_path)
+                        urdf_paths.append(new_urdf_file_path)
+                    else:
+                        urdf_paths.append(urdf_file_path)
 
             urdf_types.append('urdf')
             urdf_movables.append(obj.get('movable', False)) # by default, urdf objects are not movable, unless specified
@@ -864,6 +849,8 @@ def take_round_images_around_object(env, object_name, distance=None, save_path=N
                     prev_rgba = p.getVisualShapeData(obj_id, link_idx, physicsClientId=env.id)[0][14:18]
                     prev_rgbas.append(prev_rgba)
                     p.changeVisualShape(obj_id, link_idx, rgbaColor=[0, 0, 0, 0], physicsClientId=env.id)
+    else:
+        prev_rgbas = []
 
                                     
     obj_id = env.urdf_ids[object_name]
@@ -928,9 +915,20 @@ def get_handle_pos(simulator, obj_name, return_median=True, handle_pts_obj_frame
         urdf_path = simulator.urdf_paths[obj_name]
         parent_dir = os.path.dirname(urdf_path)
         start_idx = parent_dir.find("data/dataset")
-        parent_dir = parent_dir[start_idx:]
-        parent_dir = os.path.join(os.environ["PROJECT_DIR"], parent_dir)
+        if start_idx != -1:
+            parent_dir = parent_dir[start_idx:]
+            parent_dir = os.path.join(os.environ["PROJECT_DIR"], parent_dir)
         mobility_info = json.load(open(f"{parent_dir}/mobility_v2.json", "r"))
+    else:
+        # If mobility_info is provided, we still need parent_dir for loading meshes
+        # Try to derive it from urdf_path if possible, or assume it's passed in some other way
+        # For now, let's try to derive it same as above
+        urdf_path = simulator.urdf_paths[obj_name]
+        parent_dir = os.path.dirname(urdf_path)
+        start_idx = parent_dir.find("data/dataset")
+        if start_idx != -1:
+            parent_dir = parent_dir[start_idx:]
+            parent_dir = os.path.join(os.environ["PROJECT_DIR"], parent_dir)
     
     # return a list of handle points in world frame
     ret_handle_pt_list = []
@@ -1027,6 +1025,8 @@ def get_handle_pos(simulator, obj_name, return_median=True, handle_pts_obj_frame
             elif joint_type == p.JOINT_PRISMATIC:
                 translation = p.getJointState(obj_id, joint_idx, physicsClientId=simulator.id)[0]
                 rotated_handle_pt = handle_point_median + axis_dir_world * translation
+            else:
+                rotated_handle_pt = handle_point_median
                 
             # import pdb; pdb.set_trace()
             # rotated_handle_pt = handle_points_world.T

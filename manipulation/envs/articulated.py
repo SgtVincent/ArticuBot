@@ -1,5 +1,5 @@
 # from manipulation.sim import SimpleEnv
-from manipulation.sim_data_gen import SimpleEnvDataGen
+from manipulation.envs.sim_data_gen import SimpleEnvDataGen
 from manipulation.primitive_api import *
 import gym
 

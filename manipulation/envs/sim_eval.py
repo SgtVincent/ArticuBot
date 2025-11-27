@@ -20,7 +20,7 @@ from manipulation.gpt_primitive_api import get_link_handle
 from scipy.spatial.transform import Rotation as R
 from manipulation.panda import Panda
 from typing import List, Optional
-from manipulation.sim_base import SimpleEnvBase
+from manipulation.envs.sim_base import SimpleEnvBase
 
 class SimpleEnvEval(SimpleEnvBase):
     def __init__(self, 
