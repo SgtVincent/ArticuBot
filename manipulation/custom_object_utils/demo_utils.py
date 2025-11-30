@@ -19,6 +19,13 @@ from manipulation.custom_object_utils.object_utils import (
 import manipulation.envs.articulated as articulated_env_module
 from manipulation.gen_demo import _execute as base_inner_execute
 import manipulation.custom_object_utils.primitive_api as custom_api
+# Optional on-demand GraspGen integration
+from manipulation.custom_object_utils.graspgen_client import (
+    GraspGenConfig,
+    predict_grasps_for_urdf_folder,
+    prepare_urdf_with_joint_state,
+    load_predicted_grasps_yaml,
+)
 
 
 def _resolve_relative_path(path_value: pathlib.Path | str, base_dir: pathlib.Path) -> pathlib.Path:
@@ -27,6 +34,10 @@ def _resolve_relative_path(path_value: pathlib.Path | str, base_dir: pathlib.Pat
     if candidate.is_absolute():
         return candidate
     return (base_dir / candidate).resolve(strict=False)
+
+# Export a public name expected by callers
+def resolve_relative_path(path_value: pathlib.Path | str, base_dir: pathlib.Path) -> pathlib.Path:
+    return _resolve_relative_path(path_value, base_dir)
 
 
 def parse_config_metadata(config_path: str) -> Tuple[str, str, str, str]:
@@ -179,6 +190,9 @@ def _custom_gen_init_state(q, config_path, env_name, render, far_distance=0.7, n
         if 'predicted_grasp_position' in config_dict:
             predicted_grasp_pos = parse_center(config_dict['predicted_grasp_position'])
             predicted_grasp_orn = parse_center(config_dict['predicted_grasp_orientation'])
+        # capture urdf path if present (for on-demand GraspGen)
+        if 'urdf_path' in config_dict and 'urdf_path' not in locals():
+            urdf_path_for_graspgen = config_dict['urdf_path']
             
     if object_name is None:
         print("Error: object name not found in config")
@@ -277,8 +291,72 @@ def _custom_gen_init_state(q, config_path, env_name, render, far_distance=0.7, n
                     good_init_pos = True
                     break
         else:
-            print("No predicted grasp found in config. Skipping.")
-            break
+            # No predicted grasp in config: try on-demand GraspGen if available
+            # Determine URDF path
+            urdf_path = locals().get('urdf_path_for_graspgen', None)
+            if urdf_path is None:
+                # try to find a urdf in the same folder as config
+                cfg_parent = pathlib.Path(config_path).resolve().parent.parent
+                candidates = list(pathlib.Path(cfg_parent).glob('*.urdf'))
+                urdf_path = str(candidates[0]) if candidates else None
+
+            if urdf_path is None:
+                print("No URDF path available for on-demand GraspGen. Skipping.")
+                break
+
+            # Collect current joint states of the object
+            joint_states = {}
+            num_joints = p.getNumJoints(object_id, physicsClientId=env.id)
+            for ji in range(num_joints):
+                jinfo = p.getJointInfo(object_id, ji, physicsClientId=env.id)
+                jname = jinfo[1].decode('utf-8')
+                jtype = jinfo[2]
+                if jtype == p.JOINT_FIXED:
+                    continue
+                jstate = p.getJointState(object_id, ji, physicsClientId=env.id)[0]
+                joint_states[jname] = float(jstate)
+
+            # Prepare temporary URDF folder with joint states recorded
+            # Place intermediate data inside the object's artifact folder so
+            # the container mount (data/custom_objects -> /code/GraspGenModels/custom_objects)
+            # can access it.
+            import shutil, uuid
+            urdf_parent = pathlib.Path(urdf_path).resolve().parent
+            tmp_dir = str(urdf_parent / f"_tmp_{uuid.uuid4().hex[:8]}")
+            pathlib.Path(tmp_dir).mkdir(parents=True, exist_ok=True)
+            try:
+                prepared = prepare_urdf_with_joint_state(urdf_path, joint_states, tmp_dir, scale=1.0)
+                # Configure GraspGenConfig so host<->container path mapping matches runtime mounts
+                # Host GraspGenModels root is 3 levels up from URDF (urdf -> object_folder -> custom_objects -> GraspGenModels)
+                host_root = str(pathlib.Path(urdf_path).resolve().parent.parent.parent)
+                gg_cfg = GraspGenConfig(
+                    host_graspgen_root=host_root,
+                    container_graspgen_root="/code/GraspGenModels",
+                )
+                grasps, confidences = predict_grasps_for_urdf_folder(prepared, gg_cfg)
+                if len(confidences) == 0:
+                    print(f"GraspGen produced no grasps for {prepared}")
+                    # cleanup and fallback
+                    shutil.rmtree(tmp_dir)
+                    break
+
+                # pick best grasp by confidence
+                idx = int(np.argmax(confidences))
+                sel = grasps[idx]
+                pos = sel[:3, 3]
+                rot = R.from_matrix(sel[:3, :3])
+                quat = rot.as_quat()  # x,y,z,w
+                predicted_grasp_pos = pos.tolist()
+                predicted_grasp_orn = quat.tolist()
+                # cleanup tmp
+                shutil.rmtree(tmp_dir)
+            except Exception as e:
+                print(f"On-demand GraspGen failed: {e}")
+                try:
+                    shutil.rmtree(tmp_dir)
+                except Exception:
+                    pass
+                break
             
     if not good_init_pos:
         q.put(False)

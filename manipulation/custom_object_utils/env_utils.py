@@ -62,7 +62,8 @@ def _load_handle_points(
     if handle_pts_override:
         override_path = Path(handle_pts_override)
         if override_path.exists():
-            return np.load(override_path)
+            pts = np.load(override_path)
+            return pts * scaling  # Apply scaling to NPY override
     
     # Try OBJ
     handle_obj_path = asset_root / "parts_render" / f"{handle_id}{target_object}.obj"
@@ -92,12 +93,20 @@ def _load_handle_points(
     # Try {handle_id}handle_points.npy
     npy_path = asset_root / "parts_render" / f"{handle_id}handle_points.npy"
     if npy_path.exists():
-        return np.load(npy_path)
+        pts = np.load(npy_path)
+        return pts * scaling
 
     # Try {handle_id}{target_object}.npy
     npy_path_2 = asset_root / "parts_render" / f"{handle_id}{target_object}.npy"
     if npy_path_2.exists():
-        return np.load(npy_path_2)
+        pts = np.load(npy_path_2)
+        return pts * scaling
+    
+    # Try {handle_id}{target_object}_points.npy
+    npy_path_3 = asset_root / "parts_render" / f"{handle_id}{target_object}_points.npy"
+    if npy_path_3.exists():
+        pts = np.load(npy_path_3)
+        return pts * scaling
 
     raise FileNotFoundError(f"Could not find handle points for {handle_id}{target_object} in {asset_root}/parts_render")
 

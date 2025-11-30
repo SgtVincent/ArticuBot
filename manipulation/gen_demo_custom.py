@@ -23,7 +23,7 @@ from manipulation.custom_object_utils.demo_utils import (
     create_variant_config,
     custom_gen_init_state,
     custom_execute,
-    _resolve_relative_path,
+    resolve_relative_path,
 )
 
 
@@ -76,7 +76,7 @@ def main() -> None:
         # Try resolving relative to CWD first (common for paths in config generated from root)
         p_cwd = pathlib.Path(annotation_hint).resolve()
         # Try resolving relative to config file
-        p_rel = _resolve_relative_path(annotation_hint, config_parent)
+        p_rel = resolve_relative_path(annotation_hint, config_parent)
         
         if p_cwd.exists():
             args.annotation_path = p_cwd
@@ -103,14 +103,30 @@ def main() -> None:
     # Load predicted grasps if available
     predicted_grasps_path = asset_dir / "predicted_grasps.yml"
     predicted_grasps = None
+    
     if predicted_grasps_path.exists():
         print(f"Loading predicted grasps from {predicted_grasps_path}")
         predicted_grasps = load_predicted_grasps(predicted_grasps_path)
         if len(predicted_grasps[0]) == 0:
-            print("No grasps found in predicted_grasps.yml")
+            print("No grasps found in predicted_grasps.yml, will use on-demand GraspGen")
             predicted_grasps = None
         else:
             print(f"Loaded {len(predicted_grasps[0])} grasps")
+            
+            # ENFORCEMENT: Pre-generated grasps require fixed scale (no randomization)
+            # Grasps are predicted for a specific object state; scale/joint changes invalidate them
+            scale_min, scale_max = args.size_scale
+            if abs(scale_min - scale_max) > 1e-6 or abs(scale_min - 1.0) > 1e-6:
+                cprint("=" * 70, "yellow")
+                cprint("WARNING: Pre-generated grasps detected (predicted_grasps.yml exists).", "yellow")
+                cprint("Grasps are computed for a FIXED object state (scale=1.0, default joints).", "yellow")
+                cprint(f"Your --size-scale ({scale_min}, {scale_max}) enables scale randomization.", "yellow")
+                cprint("ENFORCING: Setting --size-scale to (1.0, 1.0) to prevent grasp mismatches.", "yellow")
+                cprint("To use scale/joint randomization, delete predicted_grasps.yml for on-demand GraspGen.", "yellow")
+                cprint("=" * 70, "yellow")
+                args.size_scale = (1.0, 1.0)
+    else:
+        cprint("No predicted_grasps.yml found. Will use on-demand GraspGen for each randomized state.", "cyan")
 
     solution_root = pathlib.Path(solution_path).expanduser().resolve(strict=False)
     experiment_path = solution_root / "experiment" / args.exp_name

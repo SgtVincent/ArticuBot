@@ -515,7 +515,7 @@ if __name__ == "__main__":
     args.add_argument("--save_path", type=str, required=True)
     args.add_argument("--folder_name", type=str, required=True)
     args.add_argument("--exp_name", type=str, default=None)
-    args.add_argument("--env_name", type=str, default="articulated")
+    args.add_argument("--env_name", type=str, default="articulated_custom_object")
     args.add_argument("--extract_name", type=str, default=None)
     args.add_argument("--num_experiment", type=int, default=10000)
     args = args.parse_args()
