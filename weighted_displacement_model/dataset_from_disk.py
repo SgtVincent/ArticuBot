@@ -124,6 +124,9 @@ def get_dataset_from_pickle(all_obj_paths=None, beg_ratio=0, end_ratio=0.9, use_
             real_world_camera_500_paths = sorted(real_world_camera_500_paths)
             real_world_camera_500_paths = [os.path.join("/scratch/yufeiw2/dp3_demo_real_world_noise_pcd_clean_distorted_goal", x) for x in real_world_camera_500_paths]
             all_obj_paths = non_real_world_camera_500_paths + real_world_camera_500_paths
+        elif num_train_objects == 'custom':
+            all_subfolders = sorted(os.listdir(dataset_prefix))
+            all_obj_paths = [os.path.join(dataset_prefix, x) for x in all_subfolders if os.path.isdir(os.path.join(dataset_prefix, x))]
         else:
             raise ValueError('num_train_objects not supported')
         
