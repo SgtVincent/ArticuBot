@@ -219,6 +219,9 @@ class RobogenPointCloudWrapperCustom(RobogenPointCloudWrapper):
         self._env.view_matrix = self.view_matrices[0]
         self._env.projection_matrix = self.project_matrices[0]
         
+        # Initialize time_step counter (used in step() method)
+        self.time_step = 0
+        
         # Skip goal loading during extraction - goals will be computed from trajectory
         if "act3d_goal" in self.observation_mode and not skip_goal_loading:
             self._load_goal_states()
