@@ -603,8 +603,3 @@ class RobogenPointCloudWrapperCustom(RobogenPointCloudWrapper):
         
         return obs_dict_input
 
-
-__all__ = [
-    'RobogenPointCloudWrapperCustom',
-    'get_link_pc_custom',
-]

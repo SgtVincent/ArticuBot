@@ -597,9 +597,3 @@ def extract_demos_from_a_directory_custom(
     cprint(f"\nExtraction complete! Saved {len(all_demo_paths)} demos to {save_path}", "green")
     return all_demo_paths
 
-
-__all__ = [
-    'extract_demos_from_a_directory_custom',
-    'extract_pc_states_for_all_trajectories_custom',
-    'RobogenPointCloudWrapperCustom',
-]

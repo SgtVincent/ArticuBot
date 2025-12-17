@@ -343,12 +343,3 @@ def predict_grasps_on_demand(
     print(f"[GraspGen] Generating new grasps for {asset_dir}")
     return predict_grasps_for_urdf_folder(str(asset_dir), config)
 
-
-__all__ = [
-    "GraspGenConfig",
-    "predict_grasps_for_urdf_folder",
-    "predict_grasps_on_demand",
-    "load_predicted_grasps_yaml",
-    "run_graspgen_in_docker",
-    "prepare_urdf_with_joint_state",
-]

@@ -1,0 +1,3 @@
+[submodule "third_party/rm4d"]
+	path = third_party/rm4d
+	url = https://github.com/mrudorfer/rm4d.git

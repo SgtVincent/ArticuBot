@@ -110,17 +110,43 @@ The on-demand system:
 
 ## Step 3: Generate Demonstrations
 
-Run the demo generation script:
+The demo generation script supports **two sampling methods**:
+
+1. **Heuristic (Original)**: Random object placement + robot configuration sampling
+2. **IK-Filtered (New)**: Uses inverse kinematics map to pre-filter object placements
+
+### Using the Heuristic Method (Original)
+
+The heuristic method samples object positions randomly and attempts to find valid robot configurations:
 
 ```bash
 python manipulation/gen_demo_custom.py \
     --asset-dir data/custom_objects/sim_microwave_good \
-    --exp-name sim_microwave_demos \
+    --exp-name sim_microwave_demos_heuristic \
+    --sampling-method heuristic \
     --num-to-generate 100 \
     --max-try-times 500 \
     --timeout-init 120 \
     --timeout-exec 300
 ```
+
+### Using the IK-Filtered Method (New Algorithm)
+
+The IK-filtered method uses RM4D reachability maps to pre-filter object placements, significantly improving sampling efficiency:
+
+```bash
+python manipulation/gen_demo_custom.py \
+    --asset-dir data/custom_objects/sim_microwave_good \
+    --exp-name sim_microwave_demos_ikfiltered \
+    --sampling-method ik_filtered \
+    --rm4d-map data/rm4d_franka_1M.npy \
+    --num-to-generate 100 \
+    --max-try-times 300 \
+    --timeout-init 120 \
+    --timeout-exec 300
+```
+
+> **Note**: The IK-filtered method requires a pre-computed RM4D reachability map. See [RM4D Setup](#rm4d-setup) for details.
 
 ### Key Arguments
 
@@ -128,6 +154,7 @@ python manipulation/gen_demo_custom.py \
 |----------|---------|-------------|
 | `--asset-dir` | Required | Path to object asset folder |
 | `--exp-name` | `debug_custom` | Experiment name for output |
+| `--sampling-method` | `heuristic` | Sampling method: `heuristic` or `ik_filtered` |
 | `--num-to-generate` | 10 | Number of successful demos to collect |
 | `--max-try-times` | 200 | Maximum attempts before giving up |
 | `--center-jitter` | 0.05 | Position randomization (meters) |
@@ -138,6 +165,45 @@ python manipulation/gen_demo_custom.py \
 | `--render` | False | Enable GUI visualization |
 | `--timeout-init` | 60.0 | Timeout for init state generation |
 | `--timeout-exec` | 300.0 | Timeout for demo execution |
+
+#### IK-Filtered Method Specific Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--rm4d-map` | None | Path to RM4D reachability map (.npy) |
+| `--object-traj` | None | Pre-computed object-frame trajectory (npz) |
+| `--rm4d-coverage-thresh` | 0.8 | Minimum trajectory coverage |
+| `--rm4d-reachability-thresh` | 0.5 | Minimum reachability fraction |
+| `--approach-distance` | 0.15 | Gripper approach distance (meters) |
+| `--target-ratio` | 0.8 | Target opening ratio for manipulation |
+
+### Algorithm Comparison
+
+#### Heuristic Method (Original)
+```python
+for each demo attempt:
+    1. Sample random object position/orientation
+    2. Sample random robot configuration
+    3. Check if robot can reach the grasp pose
+    4. If yes, attempt motion planning and execution
+    # Problem: Many attempts wasted on infeasible placements
+```
+
+#### IK-Filtered Method (New)
+```python
+for each demo attempt:
+    1. Sample randomized object config (scale, joint angles)
+    2. Predict grasps for the object state
+    3. Compute in-contact trajectory in object frame
+    4. Sample object poses, filtering with IK map along trajectory
+    5. Execute manipulation on filtered poses
+    # Advantage: Rejects infeasible placements BEFORE motion planning
+```
+
+The IK-filtered method typically achieves **2-5x higher success rate** per attempt because it uses the RM4D inverse reachability map to reject infeasible object placements before attempting expensive motion planning.
+ 
+
+
 
 ### What the Pipeline Does
 
@@ -156,6 +222,76 @@ experiment/<exp_name>/
 ├── demo_0001.pkl
 └── ...
 ```
+
+---
+
+## RM4D Setup
+
+The IK-filtered method requires a pre-computed RM4D (Reachability Map 4D) reachability map. The map encodes inverse reachability information for the robot arm.
+
+### Using Pre-computed Maps
+
+Pre-computed maps are available in `data/`:
+
+```bash
+# 1M sample Franka map (recommended)
+data/rm4d_franka_1M.npy
+
+# Alternative sizes available (faster but less accurate)
+data/rm4d_franka_1M.100000.npy   # 100K samples
+data/rm4d_franka_1M.200000.npy   # 200K samples
+```
+
+### Creating a New Map
+
+If you need to create a new map (e.g., for a different robot) you have two options: use the Python helper or run the bundled CLI script.
+
+Python API (programmatic):
+
+```python
+from manipulation.rm4d_filtering import load_or_create_rm4d_map
+
+# This will create a new map if it doesn't exist
+rmap = load_or_create_rm4d_map(
+    map_path="data/rm4d_franka_1M.npy",
+    robot_type="franka",
+    n_samples=1_000_000,
+    voxel_res=0.05,
+    n_bins_theta=36,
+)
+```
+
+CLI script (recommended for reproducible builds):
+
+```bash
+# Build a 1M-sample RM4D map for Franka (runs in PyBullet, may take 10-60min)
+source prepare.sh && conda activate articubot
+python scripts/build_rm4d_map.py --robot franka --samples 1000000 --output data/rm4d_franka_1M.npy
+
+# For a faster, low-resolution map (useful for testing)
+python scripts/build_rm4d_map.py --robot franka --samples 100000 --output data/rm4d_franka_100K.npy
+```
+
+Notes:
+- The builder uses PyBullet (DIRECT mode) and RM4D's joint-space sampler; run inside the project env (`source prepare.sh && conda activate articubot`).
+- Use `--checkpoint-every N` to save intermediate map checkpoints while sampling large numbers of configurations.
+
+### Visualizing an RM4D Map
+
+A lightweight interactive visualizer is provided to inspect the map and its inverse-base predictions.
+
+```bash
+# Start the viser-based visualizer and point it at your map
+source prepare.sh && conda activate articubot
+python scripts/visualize_rm4d_viser.py --rm4d-map data/rm4d_franka_1M.npy --port 8080 --max-points 50000
+```
+
+Open `http://localhost:8080` in your browser to view:
+- A sampled point-cloud of reachable EE positions (colorized by height)
+- A robot URDF with joint sliders
+- Controls to query inverse base positions for a target EE pose (toggle "Show base positions")
+
+> **Note**: `visualize_rm4d_viser.py` depends on the `viser` package (see `environment.yaml` / conda env). Sampling fewer points via `--max-points` reduces memory and rendering time.
 
 ---
 
@@ -229,11 +365,15 @@ python visualize_trajectories.py \
 
 | File | Description |
 |------|-------------|
-| `manipulation/gen_demo_custom.py` | Main demo generation script |
+| `manipulation/gen_demo_custom.py` | Main demo generation script (supports heuristic & IK-filtered) |
 | `manipulation/generate_base_config_from_urdf_custom.py` | Config generator |
 | `manipulation/custom_object_utils/demo_utils.py` | Demo utilities + on-demand GraspGen |
+| `manipulation/custom_object_utils/demo_utils_ik_filtered.py` | IK-filtered sampling utilities |
+| `manipulation/custom_object_utils/contact_trajectory.py` | In-contact trajectory computation |
+| `manipulation/custom_object_utils/ik_filtered_sampling.py` | IK-filtered sampling algorithm |
 | `manipulation/custom_object_utils/graspgen_client.py` | GraspGen Docker client |
 | `manipulation/custom_object_utils/object_utils.py` | URDF/annotation utilities |
+| `manipulation/rm4d_filtering/trajectory_filter.py` | RM4D trajectory reachability filter |
 | `test_custom_model.py` | Test pretrained policy on custom objects |
 
 ---

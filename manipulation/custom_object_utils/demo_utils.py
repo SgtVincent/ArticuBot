@@ -10,6 +10,14 @@ import pybullet as p
 from scipy.spatial.transform import Rotation as R
 from typing import Tuple, Optional
 
+from manipulation.rm4d_filtering import (
+    TrajectoryReachabilityFilter,
+    load_or_create_rm4d_map,
+    load_object_trajectory,
+    score_trajectory_reachability,
+    filter_object_pose_by_trajectory,
+)
+
 from manipulation.utils import build_up_env_gen
 from manipulation.utils import parse_center
 from manipulation.custom_object_utils.object_utils import (
@@ -164,12 +172,26 @@ def create_variant_config(
     return variant_path
 
 
-def _custom_gen_init_state(q, config_path, env_name, render, far_distance=0.7, near_distance=0.3):
+def _custom_gen_init_state(
+    q,
+    config_path,
+    env_name,
+    render,
+    far_distance=0.7,
+    near_distance=0.3,
+    rm4d_map_path: Optional[str] = None,
+    object_traj_path: Optional[str] = None,
+    coverage_threshold: float = 0.8,
+    reachability_threshold: float = 0.5,
+):
     """Generate initial state for custom object demo.
     
     For custom objects, the 'center' in config is the URDF's geometric center offset,
     NOT the target world placement position. We use 'target_position' for world 
     placement (defaults to [0.4, 0.0, 0.0] which is in front of the robot).
+    Optional RM4D map and object trajectory allow rejecting sampled object
+    placements that fall outside the robot workspace using inverse reachability
+    filtering before attempting motion planning.
     """
     config = yaml.safe_load(open(config_path, "r"))
     object_name = None
@@ -195,17 +217,38 @@ def _custom_gen_init_state(q, config_path, env_name, render, far_distance=0.7, n
             urdf_path_for_graspgen = config_dict['urdf_path']
             
     if object_name is None:
-        print("Error: object name not found in config")
         q.put(False)
         return False
         
     # Default target placement position: in front of the robot, reachable by the arm
-    # The robot base is at (0, 0, 0), arm workspace is roughly x=[0.2, 0.8], y=[-0.5, 0.5]
     if target_position is None:
         target_position = np.array([0.4, 0.0, 0.0])
         
     if base_euler is None:
         base_euler = np.array([0.0, 0.0, 0.0])
+
+    # Load RM4D reachability map and object trajectory for filtering
+    rm4d_map = None
+    traj_obj = None
+    traj_filter = None
+    if rm4d_map_path is not None:
+        try:
+            rm4d_map = load_or_create_rm4d_map(rm4d_map_path)
+        except Exception:
+            rm4d_map = None
+    if object_traj_path is not None:
+        try:
+            traj_obj = load_object_trajectory(object_traj_path)
+        except Exception:
+            traj_obj = None
+    
+    # Create trajectory filter if both map and trajectory are available
+    if rm4d_map is not None and traj_obj is not None:
+        traj_filter = TrajectoryReachabilityFilter(
+            rmap=rm4d_map,
+            coverage_threshold=coverage_threshold,
+            intersection_threshold=reachability_threshold,
+        )
 
     # create env
     env, _ = build_up_env_gen(config_path, env_name, render=render)
@@ -254,6 +297,16 @@ def _custom_gen_init_state(q, config_path, env_name, render, far_distance=0.7, n
         ])
         p.resetBasePositionAndOrientation(object_id, new_pos, new_orient, physicsClientId=env.id)
 
+        # Use RM4D inverse reachability filtering if available
+        if traj_filter is not None:
+            R_bo = R.from_quat(new_orient).as_matrix()
+            accepted, coverage, intersection = traj_filter.filter_pose(
+                (R_bo, np.array(new_pos)), traj_obj
+            )
+            if not accepted:
+                # Reject poses that fall outside the robot workspace
+                continue
+
         if predicted_grasp_pos is not None:
             # Use predicted grasp
             grasp_pos_world, _ = p.multiplyTransforms(new_pos, new_orient, predicted_grasp_pos, predicted_grasp_orn)
@@ -269,7 +322,6 @@ def _custom_gen_init_state(q, config_path, env_name, render, far_distance=0.7, n
                 contact_points = p.getContactPoints(env.robot.body, object_id, physicsClientId=env.id)
                 closest_points = p.getClosestPoints(env.robot.body, object_id, distance=0.01, physicsClientId=env.id)
                 if len(contact_points) > 0 or len(closest_points) > 0: 
-                    # print("Robot collision")
                     continue
 
                 link_contact = False
@@ -280,7 +332,6 @@ def _custom_gen_init_state(q, config_path, env_name, render, far_distance=0.7, n
                         link_contact = True
                         break
                 if link_contact: 
-                    # print("Link collision with plane")
                     continue
                 
                 # Check distance from EEF to grasp_pos_world
@@ -335,8 +386,6 @@ def _custom_gen_init_state(q, config_path, env_name, render, far_distance=0.7, n
                 )
                 grasps, confidences = predict_grasps_for_urdf_folder(prepared, gg_cfg)
                 if len(confidences) == 0:
-                    print(f"GraspGen produced no grasps for {prepared}")
-                    # cleanup and fallback
                     shutil.rmtree(tmp_dir)
                     break
 
@@ -348,10 +397,8 @@ def _custom_gen_init_state(q, config_path, env_name, render, far_distance=0.7, n
                 quat = rot.as_quat()  # x,y,z,w
                 predicted_grasp_pos = pos.tolist()
                 predicted_grasp_orn = quat.tolist()
-                # cleanup tmp
                 shutil.rmtree(tmp_dir)
-            except Exception as e:
-                print(f"On-demand GraspGen failed: {e}")
+            except Exception:
                 try:
                     shutil.rmtree(tmp_dir)
                 except Exception:
@@ -388,13 +435,37 @@ def _custom_gen_init_state(q, config_path, env_name, render, far_distance=0.7, n
     return True
 
 
-def custom_gen_init_state(config_path, env_name, render, far_distance=0.7, near_distance=0.3, timeout: float = 60.0):
+def custom_gen_init_state(
+    config_path,
+    env_name,
+    render,
+    far_distance=0.7,
+    near_distance=0.3,
+    timeout: float = 60.0,
+    rm4d_map_path: Optional[str] = None,
+    object_traj_path: Optional[str] = None,
+    coverage_threshold: float = 0.8,
+    reachability_threshold: float = 0.5,
+):
     q = mp.Queue()
-    proc = mp.Process(target=_custom_gen_init_state, args=(q, config_path, env_name, render, far_distance, near_distance))
+    proc = mp.Process(
+        target=_custom_gen_init_state,
+        args=(
+            q,
+            config_path,
+            env_name,
+            render,
+            far_distance,
+            near_distance,
+            rm4d_map_path,
+            object_traj_path,
+            coverage_threshold,
+            reachability_threshold,
+        ),
+    )
     proc.start()
     proc.join(timeout)
     if proc.is_alive():
-        print(f"_custom_gen_init_state exceeded timeout ({timeout}s). Terminating worker.")
         proc.terminate()
         proc.join()
         try:
@@ -411,15 +482,11 @@ def custom_gen_init_state(config_path, env_name, render, far_distance=0.7, near_
 
 
 def _custom_execute_wrapper(q, config_path, env_name, solution_path, experiment_path, time_string=None):
-    print(f"DEBUG: Entering _custom_execute_wrapper")
     # Monkeypatch approach_object_link_parallel in the subprocess
     articulated_env_module.approach_object_link_parallel = custom_api.approach_object_link_parallel
-    print(f"DEBUG: Monkeypatched approach_object_link_parallel")
     
     # Call the original _execute
-    print(f"DEBUG: Calling base_inner_execute")
     base_inner_execute(q, config_path, env_name, solution_path, experiment_path, time_string)
-    print(f"DEBUG: Returned from base_inner_execute")
 
 
 def custom_execute(config_path, env_name, solution_path, experiment_path, timeout: float = 300.0):
@@ -428,7 +495,6 @@ def custom_execute(config_path, env_name, solution_path, experiment_path, timeou
     proc.start()
     proc.join(timeout)
     if proc.is_alive():
-        print(f"_execute exceeded timeout ({timeout}s). Terminating worker.")
         proc.terminate()
         proc.join()
         try:
