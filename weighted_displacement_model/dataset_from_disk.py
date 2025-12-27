@@ -50,7 +50,7 @@ class PointNetDatasetFromDisk(torch.utils.data.Dataset):
         cprint('Preparing all pickle data', 'green')
         self.episode_lengths = []
         for idx, traj_path in enumerate(tqdm(self.all_trajectory_path)):
-            all_substeps = os.listdir(traj_path)
+            all_substeps = [f for f in os.listdir(traj_path) if f.endswith('.pkl')]
             self.episode_lengths.append(len(all_substeps))
                 
         self.episode_lengths = np.array(self.episode_lengths)

@@ -370,3 +370,428 @@ def generate_straight_line_trajectory(
         traj.append((R.copy(), p.astype(np.float64)))
     
     return traj
+
+
+@dataclass
+class IntegratedInverseMapSampler:
+    """Sample object poses from integrated inverse reachability map.
+    
+    This class implements a more efficient sampling approach than rejection 
+    sampling. Instead of sampling object poses and checking reachability,
+    it integrates the inverse reachability distributions along the full
+    trajectory to create a probability distribution over object placements.
+    
+    Algorithm:
+    1. For each candidate object pose (x, y, θ), transform the trajectory 
+       to world frame
+    2. For each waypoint, query if the EE pose is reachable from base at origin
+    3. Aggregate scores across all waypoints using min/product
+    4. Normalize to get a probability distribution
+    5. Sample object poses from this distribution
+    
+    This is more efficient because we pre-compute the feasibility map once,
+    then sample from it repeatedly without expensive rejection.
+    
+    Attributes:
+        rmap: The RM4D ReachabilityMap4D instance.
+        xy_resolution: Resolution for XY grid (meters).
+        theta_bins: Number of bins for object orientation around z-axis.
+        aggregation_method: How to combine waypoint scores ('min', 'product', or 'mean').
+        coverage_threshold: Minimum fraction of waypoints that must be reachable (0-1).
+            Only used when aggregation_method='mean'. If set to 0, all poses with 
+            at least one reachable waypoint are valid.
+    """
+    
+    rmap: ReachabilityMap4D
+    xy_resolution: float = 0.02
+    theta_bins: int = 24
+    aggregation_method: str = 'mean'  # 'min', 'product', or 'mean'
+    coverage_threshold: float = 0.8  # Minimum fraction of waypoints that must be reachable
+    
+    def compute_object_pose_distribution(
+        self,
+        traj_obj: Sequence[Tuple[np.ndarray, np.ndarray]],
+        xy_center: Tuple[float, float] = (0.4, 0.0),
+        xy_range: float = 0.3,
+        z_height: float = 0.0,
+        base_euler: np.ndarray = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Compute integrated reachability distribution over object poses.
+        
+        Creates a 3D grid over (x, y, θ) for object placement and computes
+        the reachability score for each cell by integrating scores along
+        the full trajectory.
+        
+        Args:
+            traj_obj: Object-frame trajectory as list of (R, p) tuples.
+            xy_center: Center of the XY sampling region (world frame).
+            xy_range: Half-width of XY sampling region.
+            z_height: Object z-coordinate (ground plane).
+            base_euler: Base euler angles for object (default: identity).
+            
+        Returns:
+            Tuple of (x_grid, y_grid, theta_grid, scores) where:
+            - x_grid: 1D array of x coordinates
+            - y_grid: 1D array of y coordinates  
+            - theta_grid: 1D array of theta values (z-rotation)
+            - scores: 3D array [nx, ny, ntheta] of reachability scores
+        """
+        if base_euler is None:
+            base_euler = np.array([0.0, 0.0, 0.0])
+        base_euler = np.asarray(base_euler, dtype=np.float64)
+        
+        # Create grid - round to avoid floating point precision issues
+        x_min, x_max = xy_center[0] - xy_range, xy_center[0] + xy_range
+        y_min, y_max = xy_center[1] - xy_range, xy_center[1] + xy_range
+        
+        x_grid = np.arange(x_min, x_max + self.xy_resolution, self.xy_resolution)
+        y_grid = np.arange(y_min, y_max + self.xy_resolution, self.xy_resolution)
+        theta_grid = np.linspace(-np.pi, np.pi, self.theta_bins, endpoint=False)
+        
+        # Round grids to avoid floating point precision issues at bin boundaries
+        # Use precision slightly higher than the grid resolution
+        decimals = int(-np.log10(self.xy_resolution)) + 3  # e.g., 0.05 -> 4 decimals
+        x_grid = np.round(x_grid, decimals)
+        y_grid = np.round(y_grid, decimals)
+        
+        nx, ny, ntheta = len(x_grid), len(y_grid), len(theta_grid)
+        
+        # Pre-compute trajectory waypoints as 4x4 transforms in object frame
+        n_waypoints = len(traj_obj)
+        traj_obj_tf = np.zeros((n_waypoints, 4, 4), dtype=np.float64)
+        for i, (R_o, p_o) in enumerate(traj_obj):
+            traj_obj_tf[i, :3, :3] = np.asarray(R_o)
+            traj_obj_tf[i, :3, 3] = np.asarray(p_o)
+            traj_obj_tf[i, 3, 3] = 1.0
+        
+        # Use vectorized computation
+        scores = self._compute_scores_vectorized(
+            x_grid, y_grid, theta_grid, z_height, base_euler, traj_obj_tf
+        )
+        
+        return x_grid, y_grid, theta_grid, scores
+    
+    def _compute_scores_vectorized(
+        self,
+        x_grid: np.ndarray,
+        y_grid: np.ndarray,
+        theta_grid: np.ndarray,
+        z_height: float,
+        base_euler: np.ndarray,
+        traj_obj_tf: np.ndarray,
+    ) -> np.ndarray:
+        """Vectorized score computation for all grid cells.
+        
+        Uses the RM4D API directly to avoid floating-point precision issues
+        in the canonical base position computation.
+        
+        For 'mean' aggregation with coverage_threshold, the score is the
+        fraction of reachable waypoints, set to 0 if below threshold.
+        """
+        nx, ny, ntheta = len(x_grid), len(y_grid), len(theta_grid)
+        n_waypoints = traj_obj_tf.shape[0]
+        
+        # Initialize scores based on aggregation method
+        if self.aggregation_method == 'mean':
+            # Track count of reachable waypoints per cell
+            reachable_counts = np.zeros((nx, ny, ntheta), dtype=np.int32)
+        else:
+            # For min/product, start with 1
+            scores = np.ones((nx, ny, ntheta), dtype=np.float32)
+        
+        # Pre-compute rotation matrices for all theta values
+        R_wo_all = np.zeros((ntheta, 3, 3), dtype=np.float64)
+        for ith, theta in enumerate(theta_grid):
+            euler = base_euler.copy()
+            euler[2] += theta
+            R_wo_all[ith] = Rotation.from_euler('xyz', euler).as_matrix()
+        
+        # Build 4x4 object transforms for each (x, y, theta) combo
+        # and check reachability for each waypoint
+        debug_first = True  # Print debug info for first waypoint only
+        for wp_idx in range(n_waypoints):
+            tf_obj = traj_obj_tf[wp_idx]  # (4, 4) waypoint in object frame
+            
+            for ith in range(ntheta):
+                R_wo = R_wo_all[ith]
+                
+                for ix, x in enumerate(x_grid):
+                    for iy, y in enumerate(y_grid):
+                        if self.aggregation_method != 'mean' and scores[ix, iy, ith] == 0.0:
+                            # Already marked unreachable, skip (only for min/product)
+                            continue
+                        
+                        # Build object-to-world transform T_wo
+                        T_wo = np.eye(4)
+                        T_wo[:3, :3] = R_wo
+                        T_wo[:3, 3] = [x, y, z_height]
+                        
+                        # Transform waypoint to world frame: T_world = T_wo @ T_obj
+                        tf_world = T_wo @ tf_obj
+                        
+                        # Debug: print first waypoint's world position (only once per compute)
+                        if debug_first and wp_idx == 0 and ith == 0 and ix == len(x_grid)//2 and iy == len(y_grid)//2:
+                            print(f"  [DEBUG] Waypoint 0 at grid center: obj_frame_z={tf_obj[2,3]:.3f}, "
+                                  f"world_z={tf_world[2,3]:.3f}, z_height={z_height:.3f}")
+                            debug_first = False
+                        
+                        # Check reachability using RM4D API
+                        try:
+                            indices = self.rmap.get_indices_for_ee_pose(tf_world)
+                            is_reachable = float(self.rmap.is_reachable(indices))
+                        except (IndexError, ValueError):
+                            is_reachable = 0.0
+                        
+                        # Aggregate score
+                        if self.aggregation_method == 'mean':
+                            reachable_counts[ix, iy, ith] += int(is_reachable)
+                        elif self.aggregation_method == 'min':
+                            scores[ix, iy, ith] = min(scores[ix, iy, ith], is_reachable)
+                        else:  # product
+                            scores[ix, iy, ith] *= is_reachable
+        
+        # For mean aggregation, compute final scores with coverage threshold
+        if self.aggregation_method == 'mean':
+            scores = reachable_counts.astype(np.float32) / n_waypoints
+            # Apply coverage threshold
+            scores[scores < self.coverage_threshold] = 0.0
+        
+        return scores
+    
+    def _score_object_pose(
+        self,
+        T_wo: np.ndarray,
+        traj_obj_tf: List[np.ndarray],
+    ) -> float:
+        """Score a single object pose based on trajectory reachability.
+        
+        Args:
+            T_wo: 4x4 object pose in world frame.
+            traj_obj_tf: List of 4x4 transforms in object frame.
+            
+        Returns:
+            Reachability score (0 to 1).
+        """
+        waypoint_scores = []
+        
+        for tf_obj in traj_obj_tf:
+            # Transform to world frame: T_world = T_wo @ T_obj
+            tf_world = T_wo @ tf_obj
+            
+            # Check reachability using RM4D
+            try:
+                indices = self.rmap.get_indices_for_ee_pose(tf_world)
+                is_reachable = float(self.rmap.is_reachable(indices))
+                waypoint_scores.append(is_reachable)
+            except IndexError:
+                # Pose outside map bounds
+                waypoint_scores.append(0.0)
+        
+        if len(waypoint_scores) == 0:
+            return 0.0
+        
+        # Aggregate scores
+        if self.aggregation_method == 'min':
+            return min(waypoint_scores)
+        elif self.aggregation_method == 'product':
+            score = 1.0
+            for s in waypoint_scores:
+                score *= s
+            return score
+        else:
+            # Default to mean
+            return np.mean(waypoint_scores)
+    
+    def sample_object_pose(
+        self,
+        scores: np.ndarray,
+        x_grid: np.ndarray,
+        y_grid: np.ndarray,
+        theta_grid: np.ndarray,
+        z_height: float = 0.0,
+        base_euler: np.ndarray = None,
+        temperature: float = 1.0,
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Sample an object pose from the distribution.
+        
+        Args:
+            scores: 3D array of reachability scores.
+            x_grid: X coordinate grid.
+            y_grid: Y coordinate grid.
+            theta_grid: Theta (z-rotation) grid.
+            z_height: Object z-coordinate.
+            base_euler: Base euler angles for object.
+            temperature: Sampling temperature (higher = more uniform).
+            
+        Returns:
+            Tuple of (position, quaternion, score) for sampled pose.
+        """
+        if base_euler is None:
+            base_euler = np.array([0.0, 0.0, 0.0])
+        base_euler = np.asarray(base_euler, dtype=np.float64)
+        
+        # Flatten scores for sampling
+        flat_scores = scores.flatten()
+        
+        # Apply temperature and normalize to probability distribution
+        if np.max(flat_scores) > 0:
+            probs = np.power(flat_scores, 1.0 / temperature)
+            probs = probs / np.sum(probs)
+        else:
+            # No valid poses, return failure
+            return np.zeros(3), np.array([0, 0, 0, 1]), 0.0
+        
+        # Sample index
+        flat_idx = np.random.choice(len(probs), p=probs)
+        
+        # Convert flat index to 3D indices
+        nx, ny, ntheta = scores.shape
+        ix = flat_idx // (ny * ntheta)
+        iy = (flat_idx % (ny * ntheta)) // ntheta
+        ith = flat_idx % ntheta
+        
+        # Get sampled values
+        x = x_grid[ix]
+        y = y_grid[iy]
+        theta = theta_grid[ith]
+        score = scores[ix, iy, ith]
+        
+        # Construct pose
+        position = np.array([x, y, z_height], dtype=np.float64)
+        euler = base_euler.copy()
+        euler[2] += theta
+        quaternion = Rotation.from_euler('xyz', euler).as_quat()
+        
+        return position, quaternion, score
+    
+    def sample_object_poses_batch(
+        self,
+        scores: np.ndarray,
+        x_grid: np.ndarray,
+        y_grid: np.ndarray,
+        theta_grid: np.ndarray,
+        n_samples: int = 10,
+        z_height: float = 0.0,
+        base_euler: np.ndarray = None,
+        temperature: float = 1.0,
+    ) -> List[Tuple[np.ndarray, np.ndarray, float]]:
+        """Sample multiple object poses from the distribution.
+        
+        Args:
+            scores: 3D array of reachability scores.
+            x_grid, y_grid, theta_grid: Coordinate grids.
+            n_samples: Number of poses to sample.
+            z_height: Object z-coordinate.
+            base_euler: Base euler angles for object.
+            temperature: Sampling temperature.
+            
+        Returns:
+            List of (position, quaternion, score) tuples.
+        """
+        if base_euler is None:
+            base_euler = np.array([0.0, 0.0, 0.0])
+        base_euler = np.asarray(base_euler, dtype=np.float64)
+        
+        # Flatten and create probability distribution
+        flat_scores = scores.flatten()
+        
+        if np.max(flat_scores) == 0:
+            return []
+        
+        probs = np.power(flat_scores, 1.0 / temperature)
+        probs = probs / np.sum(probs)
+        
+        # Sample indices
+        flat_indices = np.random.choice(len(probs), size=n_samples, p=probs)
+        
+        nx, ny, ntheta = scores.shape
+        results = []
+        
+        for flat_idx in flat_indices:
+            ix = flat_idx // (ny * ntheta)
+            iy = (flat_idx % (ny * ntheta)) // ntheta
+            ith = flat_idx % ntheta
+            
+            x, y, theta = x_grid[ix], y_grid[iy], theta_grid[ith]
+            score = scores[ix, iy, ith]
+            
+            position = np.array([x, y, z_height], dtype=np.float64)
+            euler = base_euler.copy()
+            euler[2] += theta
+            quaternion = Rotation.from_euler('xyz', euler).as_quat()
+            
+            results.append((position, quaternion, score))
+        
+        return results
+    
+    def get_best_object_pose(
+        self,
+        scores: np.ndarray,
+        x_grid: np.ndarray,
+        y_grid: np.ndarray,
+        theta_grid: np.ndarray,
+        z_height: float = 0.0,
+        base_euler: np.ndarray = None,
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Get the object pose with highest reachability score.
+        
+        Args:
+            scores: 3D array of reachability scores.
+            x_grid, y_grid, theta_grid: Coordinate grids.
+            z_height: Object z-coordinate.
+            base_euler: Base euler angles for object.
+            
+        Returns:
+            Tuple of (position, quaternion, score) for best pose.
+        """
+        if base_euler is None:
+            base_euler = np.array([0.0, 0.0, 0.0])
+        base_euler = np.asarray(base_euler, dtype=np.float64)
+        
+        # Find argmax
+        flat_idx = np.argmax(scores)
+        
+        nx, ny, ntheta = scores.shape
+        ix = flat_idx // (ny * ntheta)
+        iy = (flat_idx % (ny * ntheta)) // ntheta
+        ith = flat_idx % ntheta
+        
+        x, y, theta = x_grid[ix], y_grid[iy], theta_grid[ith]
+        score = scores[ix, iy, ith]
+        
+        position = np.array([x, y, z_height], dtype=np.float64)
+        euler = base_euler.copy()
+        euler[2] += theta
+        quaternion = Rotation.from_euler('xyz', euler).as_quat()
+        
+        return position, quaternion, score
+
+
+def create_integrated_inverse_sampler(
+    rmap: ReachabilityMap4D,
+    xy_resolution: float = 0.02,
+    theta_bins: int = 24,
+    aggregation_method: str = 'mean',
+    coverage_threshold: float = 0.8,
+) -> IntegratedInverseMapSampler:
+    """Create an integrated inverse map sampler.
+    
+    Convenience function for creating the sampler.
+    
+    Args:
+        rmap: RM4D reachability map.
+        xy_resolution: Grid resolution in meters.
+        theta_bins: Number of orientation bins.
+        aggregation_method: 'min', 'product', or 'mean'.
+        coverage_threshold: Minimum fraction of reachable waypoints (for 'mean').
+        
+    Returns:
+        IntegratedInverseMapSampler instance.
+    """
+    return IntegratedInverseMapSampler(
+        rmap=rmap,
+        xy_resolution=xy_resolution,
+        theta_bins=theta_bins,
+        aggregation_method=aggregation_method,
+        coverage_threshold=coverage_threshold,
+    )

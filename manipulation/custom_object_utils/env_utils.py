@@ -64,8 +64,21 @@ def _load_handle_points(
         if override_path.exists():
             pts = np.load(override_path)
             return pts * scaling  # Apply scaling to NPY override
-    
-    # Try OBJ
+
+    # Prefer pre-computed point clouds when available.
+    # These are commonly produced by the custom-object pipeline and are reliable
+    # even when OBJ exports contain only vertices (no faces).
+    npy_candidates = [
+        asset_root / "parts_render" / f"{handle_id}{target_object}_points.npy",
+        asset_root / "parts_render" / f"{handle_id}{target_object}.npy",
+        asset_root / "parts_render" / f"{handle_id}handle_points.npy",
+    ]
+    for npy_path in npy_candidates:
+        if npy_path.exists():
+            pts = np.load(npy_path)
+            return pts * scaling
+
+    # Fall back to OBJ mesh.
     handle_obj_path = asset_root / "parts_render" / f"{handle_id}{target_object}.obj"
     if handle_obj_path.exists():
         handle_pts, handle_faces = load_obj(str(handle_obj_path))
@@ -88,25 +101,6 @@ def _load_handle_points(
         if added_points:
             handle_pts = np.concatenate((handle_pts, np.array(added_points)), axis=0)
         return handle_pts
-
-    # Try NPY (fallback for custom assets that pre-compute points)
-    # Try {handle_id}handle_points.npy
-    npy_path = asset_root / "parts_render" / f"{handle_id}handle_points.npy"
-    if npy_path.exists():
-        pts = np.load(npy_path)
-        return pts * scaling
-
-    # Try {handle_id}{target_object}.npy
-    npy_path_2 = asset_root / "parts_render" / f"{handle_id}{target_object}.npy"
-    if npy_path_2.exists():
-        pts = np.load(npy_path_2)
-        return pts * scaling
-    
-    # Try {handle_id}{target_object}_points.npy
-    npy_path_3 = asset_root / "parts_render" / f"{handle_id}{target_object}_points.npy"
-    if npy_path_3.exists():
-        pts = np.load(npy_path_3)
-        return pts * scaling
 
     raise FileNotFoundError(f"Could not find handle points for {handle_id}{target_object} in {asset_root}/parts_render")
 

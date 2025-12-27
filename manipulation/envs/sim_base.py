@@ -469,12 +469,21 @@ class SimpleEnvBase(gym.Env):
                 self.table_height = float(max_aabb[2])
     
     def adjust_object_positions(self, robot_base_pos):
+        # Check if there's an object_z_offset in the config
+        z_offset = 0.0
+        if hasattr(self, 'config') and self.config is not None:
+            for obj in self.config:
+                if 'object_z_offset' in obj:
+                    z_offset = float(obj['object_z_offset'])
+                    break
+        
         object_height = {}
         for name, id in self.urdf_ids.items():
             if name == 'robot' or name == 'plane' or name == 'init_table': continue
             min_aabb, max_aabb = self.get_aabb(id)
             min_z = min_aabb[2]
-            object_height[id] = 2 * self.init_positions[name][2] - min_z
+            # Add z_offset to elevate object (e.g., for table-top placement)
+            object_height[id] = 2 * self.init_positions[name][2] - min_z + z_offset
             pos, orient = p.getBasePositionAndOrientation(id, physicsClientId=self.id)
             new_pos = np.array(pos) 
             new_pos = self.clip_x_bbox_within_workspace(robot_base_pos, new_pos, self.on_tables[name], min_aabb, max_aabb)

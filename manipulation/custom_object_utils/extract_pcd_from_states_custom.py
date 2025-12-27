@@ -232,8 +232,20 @@ def extract_pc_states_for_all_trajectories_custom(pool_args):
         # Check if handle is visible
         try:
             handle_visibility = simulator.check_handle_observed_in_pc()
+
+            # If the default cameras barely see the handle, try one automatic
+            # camera search pass before skipping the trajectory.
+            if handle_visibility < 5 and not args.randomize_camera:
+                try:
+                    simulator.reset_random_cameras()
+                    handle_visibility = simulator.check_handle_observed_in_pc()
+                except Exception as e:
+                    print(f"Warning: Failed to auto-adjust cameras for {experiment}: {e}")
+
             if handle_visibility < 5:
-                print(f"Handle not observed in the point cloud for {experiment}, visibility={handle_visibility}")
+                print(
+                    f"Handle not observed in the point cloud for {experiment}, visibility={handle_visibility}"
+                )
                 camera_detected = False
         except Exception as e:
             print(f"Warning: Could not check handle visibility for {experiment}: {e}")

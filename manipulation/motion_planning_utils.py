@@ -12,7 +12,7 @@ PLANNER = "RRTConnect" # BITstar
 def motion_planning(env, target_pos, target_orientation, planner=None, 
                 obstacles=[], allow_collision_links=[], object_id=None, save_path=None, 
                 robot_target_joint_angle=None, target_link=None, max_sampling_it=80, smooth_path=True,
-                try_times=3, interpolation_num=None):
+                try_times=3, interpolation_num=None, ik_pos_tolerance: float = 0.001):
     np.random.seed(time.time_ns() % 2**32)
     if target_link is None:
         target_link = env.robot.right_end_effector
@@ -21,6 +21,11 @@ def motion_planning(env, target_pos, target_orientation, planner=None,
     current_joint_angles = copy.deepcopy(env.robot.get_joint_angles(indices=env.robot.right_arm_joint_indices))
     ompl_robot = pb_ompl.PbOMPLRobot(env.robot.body, control_joint_idx=env.robot.right_arm_joint_indices, object_id=object_id, env=env)
     ompl_robot.set_state(current_joint_angles)
+
+    # Clamp to OMPL robot bounds (these are the true planning bounds).
+    joint_bounds = np.asarray(ompl_robot.joint_bounds, dtype=float)
+    joint_lower = joint_bounds[:, 0]
+    joint_upper = joint_bounds[:, 1]
 
     allow_collision_robot_link_pairs = []
     pb_ompl_interface = pb_ompl.PbOMPL(ompl_robot, obstacles, allow_collision_links, 
@@ -32,11 +37,8 @@ def motion_planning(env, target_pos, target_orientation, planner=None,
     for try_idx in range(try_times):
         ompl_robot.set_state(current_joint_angles)
         # first need to compute a collision-free IK solution
-        ik_lower_limits = env.robot.ik_lower_limits
-        ik_upper_limits = env.robot.ik_upper_limits
-        ik_joint_ranges = ik_upper_limits - ik_lower_limits
-        ik_lower_limits = ik_lower_limits + 0.05 * ik_joint_ranges
-        ik_upper_limits = ik_upper_limits - 0.05 * ik_joint_ranges
+        ik_lower_limits = np.asarray(env.robot.ik_lower_limits, dtype=float)
+        ik_upper_limits = np.asarray(env.robot.ik_upper_limits, dtype=float)
         ik_joint_ranges = ik_upper_limits - ik_lower_limits
 
         ik_success = False
@@ -46,39 +48,53 @@ def motion_planning(env, target_pos, target_orientation, planner=None,
             while True:
                 target_joint_solutions = []
                 
-                # ik limits contain only the movable joints
-                ik_start_pose = np.random.uniform(ik_lower_limits, ik_upper_limits)
-                ompl_robot.set_state(ik_start_pose[env.robot.right_arm_joint_indices])
+                # Use current motor joints as a rest pose, then randomize arm joints.
+                # This biases IK towards feasible, in-bounds solutions.
+                ik_start_pose = np.asarray(env.robot.get_motor_joint_states()[1], dtype=float)
+                arm_joint_indices = env.robot.right_arm_joint_indices
+                ik_start_pose[arm_joint_indices] = np.random.uniform(
+                    ik_lower_limits[arm_joint_indices],
+                    ik_upper_limits[arm_joint_indices],
+                    size=len(arm_joint_indices),
+                )
 
-                target_joint_angle = np.array(p.calculateInverseKinematics(
-                    env.robot.body, target_link, 
-                    targetPosition=target_pos, targetOrientation=target_orientation, 
-                    maxNumIterations=10000,
-                    residualThreshold=1e-4,
-                ))
-                
+                ompl_robot.set_state(ik_start_pose[arm_joint_indices])
+
+                target_joint_angle = np.array(
+                    p.calculateInverseKinematics(
+                        env.robot.body,
+                        target_link,
+                        targetPosition=target_pos,
+                        targetOrientation=target_orientation,
+                        lowerLimits=ik_lower_limits.tolist(),
+                        upperLimits=ik_upper_limits.tolist(),
+                        jointRanges=ik_joint_ranges.tolist(),
+                        restPoses=ik_start_pose.tolist(),
+                        maxNumIterations=10000,
+                        residualThreshold=1e-4,
+                        physicsClientId=env.id,
+                    ),
+                    dtype=float,
+                )
                 target_joint_solutions.append(target_joint_angle)
 
                 for target_joint_solution in target_joint_solutions:
-                    target_joint_angle = np.array(target_joint_angle)[:len(env.robot.right_arm_joint_indices)]
+                    target_joint_angle = np.array(target_joint_solution, dtype=float)[:len(arm_joint_indices)]
+                    target_joint_angle = np.clip(target_joint_angle, joint_lower, joint_upper)
                     ompl_robot.set_state(target_joint_angle)
-                    
-                    eef_pos, eef_orient = env.robot.get_pos_orient(target_link)
-                    ik_error = np.linalg.norm(eef_pos - target_pos)
-                                        
-                    threshold = 0.001 
-                    # import pdb; pdb.set_trace()
-                    cond1 = np.all(target_joint_angle >= ik_lower_limits[:len(env.robot.right_arm_joint_indices)])
-                    cond2 = np.all(target_joint_angle <= ik_upper_limits[:len(env.robot.right_arm_joint_indices)])
+
+                    eef_pos, _ = env.robot.get_pos_orient(target_link)
+                    ik_error = np.linalg.norm(np.asarray(eef_pos, dtype=float) - target_pos)
+
+                    threshold = float(ik_pos_tolerance)
+                    eps = 1e-3
+                    cond1 = np.all(target_joint_angle >= (joint_lower - eps))
+                    cond2 = np.all(target_joint_angle <= (joint_upper + eps))
                     cond3 = pb_ompl_interface.is_state_valid(target_joint_angle)
                     cond4 = ik_error < threshold
-                    if  cond1 and cond2 and cond3 and cond4:
+                    if cond1 and cond2 and cond3 and cond4:
                         ik_success = True
                         solutions.append(target_joint_angle)
-                    else:
-                        pass
-                        # print(f"> lower limit {cond1}; < upper limit {cond2}; valid state: {cond3}; ik error: {ik_error}")
-                        # import pdb; pdb.set_trace()
 
                 it += 1
 
@@ -99,8 +115,9 @@ def motion_planning(env, target_pos, target_orientation, planner=None,
             
             
         if not ik_success:
-            # cprint(f"try_idx: {try_idx}, ik failed", "red")
             continue
+        else:
+            cprint(f"[MP] try_idx: {try_idx}, IK succeeded with {len(solutions) if robot_target_joint_angle is None else 1} solutions", "cyan")
         
         for planner in ["RRTstar", "BITstar", "ABITstar"]:
             pb_ompl_interface.set_planner(planner)
@@ -113,7 +130,7 @@ def motion_planning(env, target_pos, target_orientation, planner=None,
             ompl_robot.set_state(current_joint_angles)
 
             if not res:
-                print("motion planning failed to find a path")
+                pass  # Motion planning failed to find a path
             else:
                 paths.append(path)
                 translation_length, rotation_length = get_path_length(env, path)

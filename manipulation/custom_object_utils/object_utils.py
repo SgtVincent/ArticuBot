@@ -141,14 +141,11 @@ def ensure_support_files(asset_dir: Path, args, handle_name: str) -> None:
         except Exception:
             ann_pts = None
         if ann_pts is not None:
-            min_corner = np.min(ann_pts, axis=0) - args.handle_dilate
-            max_corner = np.max(ann_pts, axis=0) + args.handle_dilate
-
             print(f"Extracting handle points for {handle_name} from {args.urdf_path}")
             mesh_infos = collect_mesh_info(args.urdf_path.parent, args.urdf_path, handle_name)
             print(f"Found {len(mesh_infos)} meshes for link {handle_name}")
             
-            handle_pts_list = []
+            all_vertices = []
             for mesh_path, xyz, rpy in mesh_infos:
                 if not mesh_path.exists():
                     continue
@@ -160,24 +157,250 @@ def ensure_support_files(asset_dir: Path, args, handle_name: str) -> None:
                 # Apply transform
                 rot = R.from_euler('xyz', rpy).as_matrix()
                 v = (rot @ v.T).T + np.array(xyz)
+                all_vertices.append(v)
 
-                mask = np.all((v >= min_corner) & (v <= max_corner), axis=1)
-                if np.any(mask):
-                    handle_pts_list.append(v[mask])
-            if handle_pts_list:
-                handle_pts = np.vstack(handle_pts_list)
+            if not all_vertices:
+                return
+
+            v_all = np.vstack(all_vertices)
+
+            # IMPORTANT (custom env): get_handle_pos_custom interprets handle point clouds in the
+            # *parent link* frame (see env_utils.get_handle_pos_custom: it transforms points by
+            # the parent joint's link pose). For PartNet-style URDFs, that's often the base link;
+            # for custom assets like sim_microwave_good, it's typically `link0`.
+            #
+            # We infer the intended parent-frame link from mobility_v2.json when available.
+            frame_link_name = handle_name
+            try:
+                mobility_json = asset_dir / "mobility_v2.json"
+                if mobility_json.exists():
+                    with mobility_json.open("r", encoding="utf-8") as fp:
+                        mobility_info = json.load(fp)
+                    handle_entry = next(
+                        (
+                            j for j in mobility_info
+                            if any(p.get("name") == handle_name for p in j.get("parts", []) if isinstance(p, dict))
+                        ),
+                        None,
+                    )
+                    if handle_entry is not None:
+                        parent_id = handle_entry.get("parent")
+                        if isinstance(parent_id, int) and parent_id >= 0:
+                            parent_entry = next((j for j in mobility_info if j.get("id") == parent_id), None)
+                            if parent_entry is not None:
+                                parent_parts = parent_entry.get("parts") or []
+                                if parent_parts and isinstance(parent_parts[0], dict):
+                                    frame_link_name = str(parent_parts[0].get("name") or frame_link_name)
+            except Exception:
+                frame_link_name = handle_name
+
+            def _mean_nn_dist(a: np.ndarray, b: np.ndarray) -> float:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(b)
+                d, _ = tree.query(a, k=1)
+                return float(np.mean(d))
+
+            def _try_transform_points_and_vertices_to_frame(
+                urdf_path: Path,
+                mesh_link: str,
+                frame_link: str,
+                ann_points: np.ndarray,
+                mesh_vertices_link: np.ndarray,
+            ) -> Tuple[np.ndarray, np.ndarray]:
+                """Return (ann_pts_in_frame, mesh_vertices_in_frame)."""
+                import pybullet as p
+                import pybullet_data
+
+                cid = None
+                try:
+                    cid = p.connect(p.DIRECT)
+                    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+                    body = p.loadURDF(str(urdf_path), [0, 0, 0], [0, 0, 0, 1], useFixedBase=True)
+
+                    base_link_name = p.getBodyInfo(body)[0].decode("utf-8")
+
+                    def _link_pose_world(link_name: str):
+                        if link_name == base_link_name:
+                            return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
+                        link_idx = None
+                        for ji in range(p.getNumJoints(body)):
+                            child_link_name = p.getJointInfo(body, ji)[12].decode("utf-8")
+                            if child_link_name == link_name:
+                                link_idx = ji
+                                break
+                        if link_idx is None:
+                            return None
+                        ls = p.getLinkState(body, link_idx, computeForwardKinematics=True)
+                        return ls[4], ls[5]
+
+                    frame_pose = _link_pose_world(frame_link)
+                    mesh_pose = _link_pose_world(mesh_link)
+                    if frame_pose is None or mesh_pose is None:
+                        return ann_points, mesh_vertices_link
+
+                    frame_pos, frame_orn = frame_pose
+                    mesh_pos, mesh_orn = mesh_pose
+                    inv_frame_pos, inv_frame_orn = p.invertTransform(frame_pos, frame_orn)
+
+                    # Transform annotation points from base/world into frame_link.
+                    ann_out = []
+                    for pt in np.asarray(ann_points, dtype=float):
+                        lp, _ = p.multiplyTransforms(inv_frame_pos, inv_frame_orn, pt.tolist(), [0, 0, 0, 1])
+                        ann_out.append(lp)
+                    ann_out = np.asarray(ann_out, dtype=float)
+
+                    # Transform mesh vertices from mesh_link frame into frame_link frame.
+                    rel_pos, rel_orn = p.multiplyTransforms(inv_frame_pos, inv_frame_orn, mesh_pos, mesh_orn)
+                    v_out = []
+                    for v in np.asarray(mesh_vertices_link, dtype=float):
+                        vp, _ = p.multiplyTransforms(rel_pos, rel_orn, v.tolist(), [0, 0, 0, 1])
+                        v_out.append(vp)
+                    v_out = np.asarray(v_out, dtype=float)
+
+                    return ann_out, v_out
+                except Exception:
+                    return ann_points, mesh_vertices_link
+                finally:
+                    if cid is not None:
+                        try:
+                            p.disconnect(cid)
+                        except Exception:
+                            pass
+
+            ann_pts_used = np.asarray(ann_pts, dtype=float)
+            # Try interpreting annotation points in the inferred frame link.
+            ann_candidate, v_candidate = _try_transform_points_and_vertices_to_frame(
+                args.urdf_path,
+                mesh_link=handle_name,
+                frame_link=frame_link_name,
+                ann_points=ann_pts_used,
+                mesh_vertices_link=v_all,
+            )
+            mean_before = _mean_nn_dist(ann_pts_used, v_all)
+            mean_after = _mean_nn_dist(ann_candidate, v_candidate)
+            if mean_after < mean_before:
+                print(
+                    f"Using handle points in frame '{frame_link_name}' (inferred from mobility_v2.json); "
+                    f"mean NN dist {mean_before:.4f} -> {mean_after:.4f}"
+                )
+                ann_pts_used = ann_candidate
+                v_all = v_candidate
+
+            def _save_handle_points(handle_pts: np.ndarray, *, suffix: str = "") -> None:
                 parts_render = asset_dir / "parts_render"
                 parts_render.mkdir(exist_ok=True)
                 pts_file = parts_render / f"{args.handle_part_id}{handle_name}_points.npy"
-                print(f"Saving handle points to {pts_file}")
-                np.save(pts_file, handle_pts)
                 obj_out = parts_render / f"{args.handle_part_id}{handle_name}.obj"
-                print(f"Saving handle obj to {obj_out}")
+                label = f" {suffix}" if suffix else ""
+                print(f"Saving handle points{label} to {pts_file} (n={handle_pts.shape[0]})")
+                np.save(pts_file, handle_pts)
+                print(f"Saving handle obj{label} to {obj_out}")
                 with obj_out.open("w", encoding="ascii") as f:
                     for p in handle_pts:
                         f.write(f"v {p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
+
+            def _collect_nearby_vertex_indices(
+                tree,
+                query_points: np.ndarray,
+                *,
+                r0: float,
+                max_r: float,
+                target_count: int,
+                growth: float,
+                max_iters: int,
+            ) -> tuple[set[int], float]:
+                r = float(r0)
+                collected: set[int] = set()
+                for _ in range(max_iters):
+                    matches = tree.query_ball_point(query_points, r)
+                    for lst in matches:
+                        collected.update(lst)
+                    if len(collected) >= target_count:
+                        break
+                    r *= float(growth)
+                    if r > max_r:
+                        break
+                return collected, r
+
+            min_corner = np.min(ann_pts_used, axis=0) - args.handle_dilate
+            max_corner = np.max(ann_pts_used, axis=0) + args.handle_dilate
+
+            mask = np.all((v_all >= min_corner) & (v_all <= max_corner), axis=1)
+            if np.any(mask):
+                handle_pts = v_all[mask]
+
+                # If the bbox is too tight (common with sparse annotations),
+                # densify via a radius search around the annotation points.
+                min_handle_pts = 200
+                if handle_pts.shape[0] < min_handle_pts:
+                    print(
+                        f"Handle bbox returned {handle_pts.shape[0]} points; "
+                        f"densifying with radius search (target >= {min_handle_pts})."
+                    )
+                    from scipy.spatial import cKDTree
+                    tree = cKDTree(v_all)
+                    r = max(float(args.handle_dilate), 0.01)
+                    max_r = 0.10
+                    collected_idx, r = _collect_nearby_vertex_indices(
+                        tree,
+                        ann_pts_used,
+                        r0=r,
+                        max_r=max_r,
+                        target_count=min_handle_pts,
+                        growth=1.6,
+                        max_iters=8,
+                    )
+                    if collected_idx:
+                        handle_pts = v_all[np.fromiter(collected_idx, dtype=int)]
+                        print(f"Densified handle points (radius): n={handle_pts.shape[0]}, r={r:.4f}")
+
+                    # If radius search is still sparse (coarse meshes / very small handles),
+                    # fall back to k-NN around annotation points to guarantee a minimum density.
+                    if handle_pts.shape[0] < min_handle_pts:
+                        k = min(200, int(v_all.shape[0]))
+                        if k >= 1:
+                            _, nn_idx = tree.query(ann_pts_used, k=k)
+                            nn_idx = np.asarray(nn_idx).reshape(-1)
+                            nn_idx = np.unique(nn_idx)
+                            handle_pts = v_all[nn_idx]
+                            print(f"Densified handle points (kNN): n={handle_pts.shape[0]}, k={k}")
+                _save_handle_points(handle_pts)
             else:
-                print("No handle points found inside annotation bbox!")
+                # Fallback: if annotation points are slightly misaligned with the
+                # mesh frame (common in custom assets), use a radius search around
+                # annotation points to find nearby mesh vertices.
+                print("No handle points found inside annotation bbox! Falling back to radius search.")
+                try:
+                    from scipy.spatial import cKDTree
+
+                    tree = cKDTree(v_all)
+                    r0 = max(float(args.handle_dilate), 0.01)
+                    max_r = 0.10
+                    collected_idx, r = _collect_nearby_vertex_indices(
+                        tree,
+                        ann_pts_used,
+                        r0=r0,
+                        max_r=max_r,
+                        target_count=50,
+                        growth=2.0,
+                        max_iters=6,
+                    )
+
+                    if collected_idx and r <= max_r:
+                        handle_pts = v_all[np.fromiter(collected_idx, dtype=int)]
+                        _save_handle_points(handle_pts, suffix=f"(fallback, r={r:.4f})")
+                    else:
+                        if collected_idx and r > max_r:
+                            print(
+                                f"Fallback radius search would require r={r:.4f} (> {max_r:.4f}); "
+                                "using transformed annotation points as handle point cloud instead."
+                            )
+                        else:
+                            print("Fallback radius search found no nearby vertices; using transformed annotation points instead.")
+                        handle_pts = np.asarray(ann_pts_used, dtype=float)
+                        _save_handle_points(handle_pts, suffix="(annotation)")
+                except Exception as e:
+                    print(f"Fallback handle point extraction failed: {e}")
 
 
 def estimate_size_from_meshes(mesh_paths: Sequence[Path]) -> Optional[float]:

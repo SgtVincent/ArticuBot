@@ -51,7 +51,8 @@ from manipulation.custom_object_utils.demo_utils import (
 class SamplingMethod(Enum):
     """Available sampling methods for initial state generation."""
     HEURISTIC = "heuristic"  # Original random sampling method
-    IK_FILTERED = "ik_filtered"  # New IK map filtered sampling
+    IK_FILTERED = "ik_filtered"  # IK map rejection sampling
+    INTEGRATED_INVERSE = "integrated_inverse"  # Direct sampling from integrated inverse map
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,8 +79,9 @@ def parse_args() -> argparse.Namespace:
     
     # Sampling method selection
     parser.add_argument("--sampling-method", type=str, default="heuristic",
-                        choices=["heuristic", "ik_filtered"],
-                        help="Sampling method: 'heuristic' (original) or 'ik_filtered' (new)")
+                        choices=["heuristic", "ik_filtered", "integrated_inverse"],
+                        help="Sampling method: 'heuristic' (original), 'ik_filtered' (rejection), "
+                             "or 'integrated_inverse' (direct sampling)")
     
     # Distance parameters
     parser.add_argument("--near-distance", type=float, default=0.15,
@@ -128,6 +130,8 @@ def parse_args() -> argparse.Namespace:
     # Object placement
     parser.add_argument("--target-position", type=float, nargs=3, default=(0.4, 0.0, 0.0),
                         help="Target world position (x, y, z) for object placement")
+    parser.add_argument("--object-z-offset", type=float, default=0.0,
+                        help="Z-offset to elevate object above ground (e.g., 0.7 for table height)")
     
     # RM4D/IK filtering parameters (for ik_filtered method)
     parser.add_argument("--rm4d-map", type=pathlib.Path, default=None,
@@ -139,13 +143,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rm4d-reachability-thresh", type=float, default=0.5,
                         help="Minimum reachability fraction required to accept a sampled object pose")
     
+    # Integrated inverse map parameters
+    parser.add_argument("--xy-resolution", type=float, default=0.02,
+                        help="XY grid resolution for integrated inverse map (meters)")
+    parser.add_argument("--theta-bins", type=int, default=24,
+                        help="Number of orientation bins for integrated inverse map")
+    parser.add_argument("--aggregation-method", type=str, default="mean",
+                        choices=["min", "product", "mean"],
+                        help="Method to aggregate waypoint scores: 'min', 'product', or 'mean'")
+    parser.add_argument("--coverage-threshold", type=float, default=0.5,
+                        help="Minimum fraction of reachable waypoints (for 'mean' aggregation)")
+    parser.add_argument("--sampling-temperature", type=float, default=1.0,
+                        help="Sampling temperature for integrated inverse map (higher=more uniform)")
+    parser.add_argument("--min-score-threshold", type=float, default=0.1,
+                        help="Minimum reachability score threshold for valid poses")
+    
     # Trajectory computation parameters (for ik_filtered method)
     parser.add_argument("--approach-distance", type=float, default=0.15,
                         help="Approach distance for gripper (meters)")
     parser.add_argument("--target-ratio", type=float, default=0.8,
                         help="Target opening ratio for door/drawer manipulation")
     
-    return parser.parse_args()
+    # Debugging and visualization
+    parser.add_argument("--debug-vis", action="store_true",
+                        help="Save debug visualization as GIF showing trajectory poses and inverse map values")
+    parser.add_argument("--debug-vis-output", type=pathlib.Path, default=None,
+                        help="Output path for debug visualization GIF (defaults to <exp-dir>/debug_vis.gif)")
+    parser.add_argument("--init-only", action="store_true",
+                        help="Only run initial-state sampling (and write config/init-state); skip full demo execution")
+    parser.add_argument("--use-viser", action="store_true",
+                        help="Enable interactive 3D visualization with viser (waits for keyboard input between attempts)")
+    parser.add_argument("--viser-port", type=int, default=8080,
+                        help="Port number for viser server (default: 8080)")
+    
+    args = parser.parse_args()
+
+    if args.use_viser:
+        # Avoid timing out while stepping through interactive visualization.
+        args.timeout_init = 1e6
+        args.timeout_exec = 1e6
+    
+    return args
 
 
 def validate_and_prepare_args(args: argparse.Namespace) -> None:
@@ -214,6 +252,12 @@ def validate_and_prepare_args(args: argparse.Namespace) -> None:
         if args.rm4d_map is None:
             cprint("WARNING: --rm4d-map not provided for ik_filtered method. "
                    "IK filtering will be disabled, falling back to heuristic within the method.", "yellow")
+    
+    # Validate integrated_inverse specific requirements
+    if args.sampling_method == "integrated_inverse":
+        if args.rm4d_map is None:
+            cprint("WARNING: --rm4d-map not provided for integrated_inverse method. "
+                   "Will fall back to random sampling.", "yellow")
 
 
 def load_grasps(args: argparse.Namespace) -> Optional[Tuple[np.ndarray, np.ndarray]]:
@@ -251,6 +295,14 @@ def load_grasps(args: argparse.Namespace) -> Optional[Tuple[np.ndarray, np.ndarr
         cprint("No predicted_grasps.yml found. Will use on-demand GraspGen for each randomized state.", "cyan")
     
     return predicted_grasps
+
+
+def _handle_init_only(args: argparse.Namespace, total_success: int) -> tuple[bool, int]:
+    if not args.init_only:
+        return False, total_success
+    total_success += 1
+    cprint(f"Init-only success. Total init states: {total_success}/{args.num_to_generate}", "green")
+    return True, total_success
 
 
 def setup_experiment_directory(args: argparse.Namespace) -> pathlib.Path:
@@ -338,6 +390,11 @@ def run_heuristic_generation(args: argparse.Namespace,
             cprint("Failed to generate initial state", "red")
             attempt += 1
             continue
+
+        handled, total_success = _handle_init_only(args, total_success)
+        if handled:
+            attempt += 1
+            continue
             
         success_exec = custom_execute(
             str(variant_path),
@@ -375,19 +432,8 @@ def run_ik_filtered_generation(args: argparse.Namespace,
         experiment_path: Path to experiment directory.
         predicted_grasps: Pre-loaded grasps or None for on-demand generation.
     """
-    cprint("=" * 70, "green")
     cprint("Using IK_FILTERED sampling method (new algorithm)", "green")
-    cprint("=" * 70, "green")
-    
-    # Import the new sampling utilities
-    from manipulation.custom_object_utils.contact_trajectory import (
-        parse_joint_kinematics_from_urdf,
-        parse_joint_kinematics_from_mobility,
-    )
-    from manipulation.custom_object_utils.ik_filtered_sampling import (
-        load_or_compute_trajectory,
-        SamplingConfig,
-    )
+
     from manipulation.custom_object_utils.demo_utils_ik_filtered import (
         custom_gen_init_state_ik_filtered,
     )
@@ -435,6 +481,11 @@ def run_ik_filtered_generation(args: argparse.Namespace,
             cprint("Failed to generate initial state (IK-filtered)", "red")
             attempt += 1
             continue
+
+        handled, total_success = _handle_init_only(args, total_success)
+        if handled:
+            attempt += 1
+            continue
             
         success_exec = custom_execute(
             str(variant_path),
@@ -453,6 +504,116 @@ def run_ik_filtered_generation(args: argparse.Namespace,
         attempt += 1
     
     cprint(f"\nIK_FILTERED method completed: {total_success} demos from {attempt} attempts", "green")
+
+
+def run_integrated_inverse_generation(args: argparse.Namespace,
+                                       experiment_path: pathlib.Path,
+                                       predicted_grasps: Optional[Tuple[np.ndarray, np.ndarray]]) -> None:
+    """Run demo generation using integrated inverse map sampling.
+    
+    This method implements the most efficient sampling approach:
+    1. Compute the distribution over object poses by integrating reachability
+       along the full manipulation trajectory
+    2. Sample directly from this distribution (not rejection sampling)
+    3. Check robot configuration feasibility for sampled poses
+    
+    Key insight: Instead of sampling random poses and rejecting infeasible ones,
+    we pre-compute which poses are feasible and sample from them directly.
+    
+    Args:
+        args: Parsed command line arguments.
+        experiment_path: Path to experiment directory.
+        predicted_grasps: Pre-loaded grasps or None for on-demand generation.
+    """
+    cprint("Using INTEGRATED_INVERSE sampling method (direct sampling)", "magenta")
+
+    from manipulation.custom_object_utils.demo_utils_integrated import (
+        custom_gen_init_state_integrated,
+    )
+    
+    num_existing = get_current_num_demos(str(experiment_path))
+    cprint(f"Existing successful demos: {num_existing}", "yellow")
+
+    attempt = 0
+    total_success = num_existing
+    
+    while total_success < args.num_to_generate and attempt < args.max_try_times:
+        # Step 1: Sample randomized object config
+        variant_path = create_variant_config(
+            str(args.config_path),
+            args.asset_dir,
+            attempt,
+            args._handle_name,
+            args.annotation_path,
+            args.center_jitter,
+            args.size_scale,
+            urdf_path=args.urdf_path,
+            predicted_grasps=predicted_grasps,
+            target_position=tuple(args.target_position),
+        )
+        
+        cprint(f"[INTEGRATED_INVERSE] Attempt {attempt+1}/{args.max_try_times}: {variant_path.name}", "magenta")
+        
+        # Determine debug visualization path
+        debug_vis_path = None
+        if args.debug_vis:
+            if args.debug_vis_output:
+                debug_vis_path = str(args.debug_vis_output)
+            else:
+                debug_vis_path = str(experiment_path / f"debug_vis_attempt_{attempt:04d}.gif")
+        
+        # Generate initial state using integrated inverse map method
+        success_init = custom_gen_init_state_integrated(
+            str(variant_path),
+            args.env_name,
+            args.render,
+            near_distance=args.near_distance,
+            far_distance=args.far_distance,
+            timeout=args.timeout_init,
+            rm4d_map_path=str(args.rm4d_map) if args.rm4d_map else None,
+            xy_resolution=args.xy_resolution,
+            theta_bins=args.theta_bins,
+            aggregation_method=args.aggregation_method,
+            coverage_threshold=args.coverage_threshold,
+            temperature=args.sampling_temperature,
+            min_score_threshold=args.min_score_threshold,
+            approach_distance=args.approach_distance,
+            target_ratio=args.target_ratio,
+            asset_dir=str(args.asset_dir),
+            debug_vis_path=debug_vis_path,
+            object_z_offset=args.object_z_offset,
+            use_viser=args.use_viser,
+            viser_port=args.viser_port,
+            attempt_number=attempt,
+        )
+        
+        if not success_init:
+            cprint("Failed to generate initial state (integrated inverse)", "red")
+            attempt += 1
+            continue
+
+        handled, total_success = _handle_init_only(args, total_success)
+        if handled:
+            attempt += 1
+            continue
+            
+        success_exec = custom_execute(
+            str(variant_path),
+            args.env_name,
+            str(args.asset_dir),
+            str(experiment_path),
+            timeout=args.timeout_exec
+        )
+        
+        if success_exec:
+            total_success += 1
+            cprint(f"Success! Total demos: {total_success}/{args.num_to_generate}", "green")
+        else:
+            cprint("Execution failed", "red")
+            
+        attempt += 1
+    
+    cprint(f"\nINTEGRATED_INVERSE method completed: {total_success} demos from {attempt} attempts", "magenta")
 
 
 def main() -> None:
@@ -479,6 +640,8 @@ def main() -> None:
         run_heuristic_generation(args, experiment_path, predicted_grasps)
     elif args.sampling_method == "ik_filtered":
         run_ik_filtered_generation(args, experiment_path, predicted_grasps)
+    elif args.sampling_method == "integrated_inverse":
+        run_integrated_inverse_generation(args, experiment_path, predicted_grasps)
     else:
         raise ValueError(f"Unknown sampling method: {args.sampling_method}")
 

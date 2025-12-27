@@ -116,10 +116,15 @@ def _custom_gen_init_state_ik_filtered(
         # IK-filtered method requires a predicted grasp
         q.put(False)
         return False
-        
-    grasp_pose = np.eye(4)
-    grasp_pose[:3, :3] = R.from_quat(predicted_grasp_orn).as_matrix()
-    grasp_pose[:3, 3] = predicted_grasp_pos
+
+    # Configs store predicted_grasp_position in the *scaled* object frame
+    # (see create_variant_config). Avoid double-scaling when generating trajectories.
+    grasp_pos_obj_scaled = np.array(predicted_grasp_pos, dtype=float)
+    grasp_quat = np.array(predicted_grasp_orn, dtype=float)
+
+    grasp_pose_unscaled = np.eye(4)
+    grasp_pose_unscaled[:3, :3] = R.from_quat(grasp_quat).as_matrix()
+    grasp_pose_unscaled[:3, 3] = grasp_pos_obj_scaled / float(object_scale)
 
     # Compute in-contact trajectory in object frame
     trajectory_obj = None
@@ -127,7 +132,7 @@ def _custom_gen_init_state_ik_filtered(
         asset_path = pathlib.Path(asset_dir)
         try:
             trajectory_obj = load_or_compute_trajectory(
-                grasp_pose,
+                grasp_pose_unscaled,
                 asset_path,
                 scale=object_scale,
                 approach_distance=approach_distance,
@@ -138,8 +143,8 @@ def _custom_gen_init_state_ik_filtered(
 
     if trajectory_obj is None:
         # Fall back to straight-line approach
-        grasp_p = grasp_pose[:3, 3] * object_scale
-        grasp_R = grasp_pose[:3, :3]
+        grasp_p = grasp_pos_obj_scaled
+        grasp_R = R.from_quat(grasp_quat).as_matrix()
         approach_dir = grasp_R[:, 2]
         trajectory_obj = []
         for i in range(20):
@@ -174,8 +179,7 @@ def _custom_gen_init_state_ik_filtered(
 
     # Run IK-filtered sampling
     # predicted_grasp_pos is guaranteed non-None here due to earlier check
-    grasp_pos_scaled = np.array(predicted_grasp_pos) * object_scale
-    grasp_quat = np.array(predicted_grasp_orn)
+    grasp_pos_scaled = grasp_pos_obj_scaled
     
     success, obj_pos, obj_quat, joint_angles = ik_filtered_sample_initial_state(
         env,
@@ -213,6 +217,11 @@ def _custom_gen_init_state_ik_filtered(
             saved_pos = [obj_pos[0], obj_pos[1], 0.0]
             config_dict['center'] = str(tuple(saved_pos))
             config_dict['orientation'] = str(tuple(obj_quat.tolist()))
+            # Keep euler consistent with quaternion (many utilities read 'euler').
+            try:
+                config_dict['euler'] = str(tuple(R.from_quat(np.array(obj_quat, dtype=float)).as_euler('xyz').tolist()))
+            except Exception:
+                pass
             config_dict['is_crop_size'] = False
             config_dict['initial_joint_angles'] = str(tuple(joint_angles.tolist()))
             config_dict['initial_finger_angle'] = initial_finger_angle

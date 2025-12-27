@@ -9,15 +9,22 @@ import scipy
 import time
 from termcolor import cprint
 import fpsample
-from multiprocessing import Pool
 import pickle
 import json
 from scipy.spatial.transform import Rotation as R
 
-MOTION_PLANNING_TRY_TIMES=100
-SAMPLE_ORIENTATION_NUM=3
-PARALLEL_POOL_NUM=4
-HANDLE_FPS_NUM_POINT=15
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+SAMPLE_ORIENTATION_NUM = _env_int("ARTICUBOT_SAMPLE_ORIENTATION_NUM", 3)
+HANDLE_FPS_NUM_POINT = _env_int("ARTICUBOT_HANDLE_FPS_NUM_POINT", 15)
 
 def get_save_path(simulator):
     state_save_path = os.path.join(simulator.primitive_save_path, "states")
@@ -26,15 +33,11 @@ def get_save_path(simulator):
     return simulator.primitive_save_path
 
 def approach_object_link_parallel(simulator, object_name, link_name, debug=False):    
-    debug = True # Force debug mode for single process execution
-    print(f"DEBUG: Entering approach_object_link_parallel for {object_name} {link_name}")
     save_path = get_save_path(simulator)
     ori_simulator_state = save_env(simulator, None)
     object_name = object_name.lower()
     link_name = link_name.lower()
-    print(f"DEBUG: Calling simulator.get_link_pc")
     link_pc, view, projection, img = simulator.get_link_pc(object_name, link_name)
-    print(f"DEBUG: simulator.get_link_pc returned. link_pc shape: {link_pc.shape}")
     object_pc = link_pc
     
     # Check for predicted grasp in config
@@ -42,33 +45,64 @@ def approach_object_link_parallel(simulator, object_name, link_name, debug=False
     predicted_grasp_ori = None
     
     if hasattr(simulator, 'config'):
+        # Prefer the predicted grasp stored on the actual object config block.
+        # Some task configs include other metadata blocks that also contain
+        # predicted_grasp_* fields; using the last occurrence can pick the wrong grasp.
         for block in simulator.config:
-            if "predicted_grasp_position" in block:
+            block_name = str(block.get("name", "")).lower()
+            if (
+                block_name == object_name
+                and "predicted_grasp_position" in block
+                and "predicted_grasp_orientation" in block
+            ):
                 predicted_grasp_pos = parse_center(block["predicted_grasp_position"])
-            if "predicted_grasp_orientation" in block:
                 predicted_grasp_ori = parse_center(block["predicted_grasp_orientation"])
+                break
 
-    print(f"DEBUG: Creating o3d PointCloud")
+        # Fallback: first block that contains a grasp
+        if predicted_grasp_pos is None or predicted_grasp_ori is None:
+            for block in simulator.config:
+                if "predicted_grasp_position" in block and "predicted_grasp_orientation" in block:
+                    predicted_grasp_pos = parse_center(block["predicted_grasp_position"])
+                    predicted_grasp_ori = parse_center(block["predicted_grasp_orientation"])
+                    break
     pcd = o3d.geometry.PointCloud() 
-    print(f"DEBUG: Setting points")
     pcd.points = o3d.utility.Vector3dVector(object_pc)
-    print(f"DEBUG: Estimating normals")
     pcd.estimate_normals()
-    print(f"DEBUG: Getting normals as array")
     object_normal = np.asarray(pcd.normals)
-    print(f"DEBUG: Normals estimated")
 
-    print(f"DEBUG: Calling simulator.get_handle_pos")
     all_handle_pos, handle_joint_id, axis_world, axis_end_world = simulator.get_handle_pos(return_median=False, custom_joint_name=simulator.handle_name)
-    if isinstance(all_handle_pos, np.ndarray):
-        print(f"DEBUG: simulator.get_handle_pos returned. all_handle_pos shape: {all_handle_pos.shape}")
-    else:
-        print(f"DEBUG: simulator.get_handle_pos returned. all_handle_pos type: {type(all_handle_pos)}, len: {len(all_handle_pos)}")
-    threshold = 0.02
-        
-    print(f"DEBUG: Calling get_link_handle")
-    handle_pc, handle_joint_id, handle_median, _ = get_link_handle(all_handle_pos, handle_joint_id, link_pc, threshold=threshold)
-    print(f"DEBUG: get_link_handle returned. handle_pc shape: {handle_pc.shape}")
+
+    # geometry_utils.get_link_handle expects handle_joint_id to be indexable (one per handle).
+    # Some envs return a scalar when there's only one handle.
+    if isinstance(handle_joint_id, (int, np.integer)):
+        handle_joint_id = [int(handle_joint_id)]
+    # Some custom objects have slight misalignment between rendered link point clouds
+    # and precomputed handle points; use an adaptive threshold to avoid empty handle PCs.
+    handle_pc = np.zeros((0, 3))
+    handle_median = None
+    threshold_candidates = [0.02, 0.04, 0.06, 0.08, 0.10]
+    handle_joint_ids = handle_joint_id
+    best_n = -1
+    for threshold in threshold_candidates:
+        cand_handle_pc, cand_handle_joint_id, cand_handle_median, _ = get_link_handle(
+            all_handle_pos, handle_joint_ids, link_pc, threshold=threshold
+        )
+        if cand_handle_pc.shape[0] > best_n:
+            best_n = cand_handle_pc.shape[0]
+            handle_pc = cand_handle_pc
+            handle_joint_id = cand_handle_joint_id
+            handle_median = cand_handle_median
+        if cand_handle_pc.shape[0] > 5:
+            break
+
+    # Default handle axis (from joint pose) is available even when handle_pc is empty.
+    try:
+        axis = np.asarray(axis_world[0], dtype=float)
+        axis_end = np.asarray(axis_end_world[0], dtype=float)
+    except Exception:
+        axis = np.array([0.0, 0.0, 1.0], dtype=float)
+        axis_end = np.array([0.0, 0.0, 2.0], dtype=float)
     
     # Initialize variables to avoid unbound errors
     handle_orientation = None
@@ -76,8 +110,6 @@ def approach_object_link_parallel(simulator, object_name, link_name, debug=False
     
     # Attempt to refine handle_pc if it has points
     if handle_pc.shape[0] > 5:
-        axis = axis_world[0]
-        axis_end = axis_end_world[0]
         handle_orientation = get_handle_orient(handle_pc)
         distance_pc = pc_to_line_distance(handle_pc, axis, axis_end)
 
@@ -102,23 +134,34 @@ def approach_object_link_parallel(simulator, object_name, link_name, debug=False
             handle_pc = handle_pc[selected_idx]
             handle_median = np.median(handle_pc, axis=0)
 
-    # Final check: if handle_pc is still too small, try to fallback to predicted grasp
-    if handle_pc.shape[0] <= 5:
-        if predicted_grasp_pos is None:
-            print("No handle point cloud found, return")
-            return [], []
+    if handle_dir is None:
+        axis_vec = np.asarray(axis_end, dtype=float) - np.asarray(axis, dtype=float)
+        axis_norm = float(np.linalg.norm(axis_vec))
+        if axis_norm < 1e-6:
+            handle_dir = np.array([0.0, 0.0, 1.0], dtype=float)
         else:
-            print("No handle point cloud found (or too small), but using predicted grasp")
-            handle_pc = np.zeros((0, 3))
-            handle_median = predicted_grasp_pos
-            handle_orientation = 'vertical'
-            handle_dir = np.array([0, 0, 1])
-            axis = np.array([0, 0, 1]) # Dummy axis
-            axis_end = np.array([0, 0, 2]) # Dummy axis end
-   
-    # find the necessary args
-    args = []
+            handle_dir = axis_vec / axis_norm
 
+    if handle_orientation is None:
+        # Heuristic: treat near-vertical axes as vertical handles.
+        handle_orientation = "vertical" if abs(float(handle_dir[2])) > 0.7 else "horizontal"
+
+    if handle_median is None:
+        try:
+            handle_median = np.median(np.asarray(all_handle_pos, dtype=float).reshape(-1, 3), axis=0)
+        except Exception:
+            handle_median = None
+
+    # If handle_pc is too small, still proceed with handle_median (from joint pose).
+    # Predicted grasps are used only as a last resort because their coordinate frames
+    # can be inconsistent across assets.
+    if handle_pc.shape[0] <= 5 and handle_median is None:
+        if predicted_grasp_pos is None:
+            print("No handle point cloud/median found, return")
+            return [], []
+        print("No handle point cloud/median found; falling back to predicted grasp")
+        handle_median = np.asarray(predicted_grasp_pos, dtype=float)
+   
     # parallel motion planning to search each fps handle point
     env_kwargs = {
         "task_config": simulator.config_path, 
@@ -139,43 +182,60 @@ def approach_object_link_parallel(simulator, object_name, link_name, debug=False
     target_orientations = []
     to_try_handle_points = []
 
-    if predicted_grasp_pos is not None and predicted_grasp_ori is not None:
-         # Transform from object frame to world frame
-         obj_pos, obj_ori = p.getBasePositionAndOrientation(simulator.obj_id, physicsClientId=simulator.id)
-         
-         # predicted_grasp_pos is already scaled in gen_demo_custom.py
-         # Transform: P_world = R_obj * P_local + T_obj
-         r_obj = R.from_quat(obj_ori)
-         p_world = r_obj.apply(predicted_grasp_pos) + np.array(obj_pos)
-         
-         # Orientation: Q_world = Q_obj * Q_local
-         r_local = R.from_quat(predicted_grasp_ori)
-         r_world = r_obj * r_local
-         q_world = r_world.as_quat()
-         
-         real_target_pos = p_world
-         target_orientation = q_world
-         
-         # Back off logic
-         r_grasp = R.from_quat(target_orientation)
-         mat_grasp = r_grasp.as_matrix()
-         z_axis = mat_grasp[:, 2] # Approach axis
-         
-         mp_target_pos = real_target_pos - z_axis * 0.1 # 10cm back
-         
-         mp_target_poses.append(mp_target_pos)
-         real_target_poses.append(real_target_pos)
-         target_orientations.append(target_orientation)
-         to_try_handle_points.append(real_target_pos) # Just for debug plotting
+    use_predicted_grasp = (
+        predicted_grasp_pos is not None
+        and predicted_grasp_ori is not None
+        and handle_pc.shape[0] <= 5
+        and handle_median is None
+    )
+
+    if use_predicted_grasp:
+        # Transform from object frame to world frame
+        # CRITICAL: Use urdf_ids[object_name] to get actual body ID, not obj_id which is just an index
+        object_body_id = simulator.urdf_ids[object_name]
+        obj_pos, obj_ori = p.getBasePositionAndOrientation(object_body_id, physicsClientId=simulator.id)
+
+        # predicted_grasp_pos is already scaled in gen_demo_custom.py
+        # Transform: P_world = R_obj * P_local + T_obj
+        r_obj = R.from_quat(obj_ori)
+        p_world = r_obj.apply(predicted_grasp_pos) + np.array(obj_pos)
+
+        # Orientation: Q_world = Q_obj * Q_local
+        r_local = R.from_quat(predicted_grasp_ori)
+        r_world_base = r_obj * r_local
+
+        real_target_pos = p_world
+
+        # Back off logic (keep approach direction fixed) + roll perturbations
+        mat_grasp = r_world_base.as_matrix()
+        z_axis = mat_grasp[:, 2]  # Approach axis in world
+
+        backoffs = [0.08, 0.10, 0.12]
+        roll_angles = np.deg2rad([0.0, 90.0, 180.0, -90.0])
+        for backoff in backoffs:
+            mp_target_pos = real_target_pos - z_axis * backoff
+            for roll in roll_angles:
+                r_roll = R.from_rotvec(z_axis * roll)
+                target_orientation = (r_roll * r_world_base).as_quat()
+                mp_target_poses.append(mp_target_pos)
+                real_target_poses.append(real_target_pos)
+                target_orientations.append(target_orientation)
+
+        to_try_handle_points.append(real_target_pos)  # Just for optional debug plotting
          
     else:
         # use fps to get a bunch of trying points
-        fps_point = HANDLE_FPS_NUM_POINT 
-        handle_fps_num_point = min(fps_point, len(handle_pc))
-        h = min(3, int(np.log2(handle_fps_num_point)))
-        kdline_fps_samples_idx = fpsample.bucket_fps_kdline_sampling(handle_pc, handle_fps_num_point, h=h)
-        to_try_handle_points = handle_pc[kdline_fps_samples_idx] 
-        to_try_handle_points = np.concatenate([to_try_handle_points, handle_median.reshape(1, 3)], axis=0)
+        if handle_pc.shape[0] > 0:
+            fps_point = HANDLE_FPS_NUM_POINT
+            handle_fps_num_point = min(fps_point, len(handle_pc))
+            h = min(3, int(np.log2(handle_fps_num_point))) if handle_fps_num_point > 1 else 1
+            kdline_fps_samples_idx = fpsample.bucket_fps_kdline_sampling(handle_pc, handle_fps_num_point, h=h)
+            to_try_handle_points = handle_pc[kdline_fps_samples_idx]
+            to_try_handle_points = np.concatenate(
+                [to_try_handle_points, np.asarray(handle_median).reshape(1, 3)], axis=0
+            )
+        else:
+            to_try_handle_points = np.asarray(handle_median, dtype=float).reshape(1, 3)
 
         for target_pos in to_try_handle_points:
             nearest_point_idx = np.argmin(np.linalg.norm(object_pc - target_pos.reshape(1, 3), axis=1))
@@ -231,81 +291,88 @@ def approach_object_link_parallel(simulator, object_name, link_name, debug=False
 
         return x,y
     
-    ### debug plot to see which points are we trying to grasp
-    import cv2
-    for pos in to_try_handle_points:
-        screen_x, screen_y = project_point(pos, view, projection)
-        # print("screen pos: ", screen_x, screen_y)
-        img = img.astype(np.uint8)
-        cv2.circle(img, (int(screen_x), int(screen_y)), radius=2, color=(0, 255, 0), thickness=-1)
-        cv2.imwrite("img.png", img)
-    
-    args = [[env_kwargs, object_name, real_target_poses[it], mp_target_poses[it], target_orientations[it],\
-            handle_pc, handle_joint_id, save_path, ori_simulator_state, it, link_name] for it in range(len(target_orientations))]
-
-    print(f"DEBUG: Preparing args for parallel_motion_planning. len(args)={len(args)}")
-
+    # Optional debug plot to see which points are being tried
     if debug:
-        print("DEBUG: Running in debug mode (single process)")
-        results = parallel_motion_planning(args[0])
-        results = [results]
-    else:
-        print(f"DEBUG: Starting Pool with {PARALLEL_POOL_NUM} processes")
-        with Pool(processes=PARALLEL_POOL_NUM) as pool:
-            results = pool.map(parallel_motion_planning, args)
-        print("DEBUG: Pool finished")
+        import cv2
 
-    door_opened_ratios = np.array([x[0][0] for x in results])
-    door_opened_angles = np.array([x[0][1] for x in results])
-    grasp_scores = [x[1] for x in results]
-    all_traj_states = [x[2] for x in results]
-    all_traj_rgbs = [x[3] for x in results]
-    all_stage_lengths = [x[4] for x in results]
-    all_motion_planning_path_translation_lengths = [x[5] for x in results]
-    all_motion_planning_path_rotation_lengths = [x[6] for x in results]
+        img_dbg = img.astype(np.uint8)
+        for pos in to_try_handle_points:
+            screen_x, screen_y = project_point(pos, view, projection)
+            cv2.circle(img_dbg, (int(screen_x), int(screen_y)), radius=2, color=(0, 255, 0), thickness=-1)
+        cv2.imwrite("img.png", img_dbg)
+    
+    # IMPORTANT: pybullet_ompl internally uses PyBullet's *default* physics client
+    # (many calls omit physicsClientId). Creating multiple clients in the same
+    # process (e.g., by spawning new envs per candidate or using a Pool) causes
+    # motion planning to silently fail or plan in the wrong client.
+    #
+    # To keep planning reliable, evaluate candidates sequentially in the current
+    # simulator's physics client and restore state between candidates.
+    args = [[
+        simulator,
+        object_name,
+        real_target_poses[it],
+        mp_target_poses[it],
+        target_orientations[it],
+        handle_pc,
+        handle_joint_id,
+        save_path,
+        ori_simulator_state,
+        it,
+        link_name,
+    ] for it in range(len(target_orientations))]
 
+    # Candidate evaluation can be very expensive (OMPL planning). To keep demo generation
+    # tractable for custom objects, evaluate candidates incrementally and support early stop.
     ratio_threshold = 0.7
-    if len(door_opened_ratios) > 0 and np.max(door_opened_ratios) > 0.1:
-        best_idx = None
-        if not np.sum(door_opened_ratios > ratio_threshold) > 0:
-            best_idx = np.argmax(door_opened_ratios)
-        else:
-            # NOTE: maybe optimize orientation length as well. 
-            best_rank = 100000
-            path_translation_length_rank = np.argsort(all_motion_planning_path_translation_lengths)
-            path_rotation_length_rank = np.argsort(all_motion_planning_path_rotation_lengths)
-            grasping_score_rank = np.argsort(-np.array(grasp_scores))
-            for idx, score in enumerate(door_opened_ratios):
-                if score > ratio_threshold and path_translation_length_rank[idx] + grasping_score_rank[idx] < best_rank:
-                    best_idx = idx
-                    best_rank = path_translation_length_rank[idx] + grasping_score_rank[idx]
-            
-        best_score = grasp_scores[best_idx]
+    early_stop_ratio = float(os.environ.get("ARTICUBOT_EARLY_STOP_RATIO", str(ratio_threshold)))
+    min_success_ratio = float(os.environ.get("ARTICUBOT_MIN_SUCCESS_RATIO", "0.1"))
+
+    best_result = None
+    best_ratio = -np.inf
+
+    for cand in args:
+        res = parallel_motion_planning(cand)
+        try:
+            ratio = float(res[0][0])
+        except Exception:
+            ratio = -np.inf
+
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_result = res
+
+        if ratio >= early_stop_ratio:
+            break
+
+    if best_result is not None and best_ratio > min_success_ratio:
+        best_ratio_tuple, best_score, best_traj_states, best_traj_rgbs, best_stage_length, _, _ = best_result
+
         with open(os.path.join(save_path, "best_score.txt"), "w") as f:
             f.write(str(best_score))
-            
-        # store the best env states
+
         state_files = []
-        for t_idx, state in enumerate(all_traj_states[best_idx]):
-            save_state_path = os.path.join(save_path, "states",  "state_{}.pkl".format(t_idx))
+        for t_idx, state in enumerate(best_traj_states):
+            save_state_path = os.path.join(save_path, "states", f"state_{t_idx}.pkl")
             state_files.append(save_state_path)
-            with open(save_state_path, 'wb') as f:
+            with open(save_state_path, "wb") as f:
                 pickle.dump(state, f, pickle.HIGHEST_PROTOCOL)
-        
-        # get the opened angle of the last state
-        joint_limit_low, joint_limit_high = p.getJointInfo(simulator.urdf_ids[object_name], handle_joint_id, physicsClientId=simulator.id)[8:10]
-        best_opened_angle = door_opened_angles[best_idx]
+
+        joint_limit_low, joint_limit_high = p.getJointInfo(
+            simulator.urdf_ids[object_name], handle_joint_id, physicsClientId=simulator.id
+        )[8:10]
+        best_opened_angle = best_ratio_tuple[1]
         with open(os.path.join(save_path, "opened_angle.txt"), "w") as f:
             f.write(str(best_opened_angle) + "\n")
             f.write(str(joint_limit_low) + "\n")
             f.write(str(joint_limit_high) + "\n")
+
         simulator.reset(ori_simulator_state)
-        
-        best_stage_length = all_stage_lengths[best_idx]
+
         with open(os.path.join(save_path, "stage_lengths.json"), "w") as f:
             json.dump(best_stage_length, f, indent=4)
-                
-        return all_traj_rgbs[best_idx], state_files
+
+        return best_traj_rgbs, state_files
     
     with open(os.path.join(save_path, "best_score.txt"), "w") as f:
         f.write(str(0))
@@ -345,14 +412,16 @@ def reach_till_contact(simulator, real_target_pos, target_orientation, return_co
         points_right_finger = p.getContactPoints(bodyA=simulator.robot.body, linkIndexA=simulator.robot.right_gripper_indices[1], physicsClientId=simulator.id)
         points_hand = p.getContactPoints(bodyA=simulator.robot.body, linkIndexA=8, physicsClientId=simulator.id)
         points = points_left_finger + points_right_finger + points_hand
-        collision_points_a = [points[_][5] for _ in range(len(points))]
+        # In PyBullet contacts, index 5 is typically positionOnB.
+        collision_points_a = [pt[5] for pt in points]
         if len(collision_points_a) > 0:
             p.addUserDebugPoints(collision_points_a, [[0, 1, 0] for _ in range(len(collision_points_a))], 12, 0.55, physicsClientId=simulator.id)
         if points:
             # Handle contact between suction with a rigid object.
             for point in points:
-                obj_id, contact_link, contact_position_on_obj = point[2], point[4], point[6]
-                if obj_id == simulator.urdf_ids['plane'] or obj_id == simulator.robot.body:
+                # PyBullet layout: (bodyA, bodyB, linkA, linkB, posA, posB, ...)
+                body_b = point[1]
+                if body_b == simulator.urdf_ids['plane'] or body_b == simulator.robot.body:
                     pass
                 else:
                     collision = True    
@@ -372,7 +441,7 @@ def reach_till_contact(simulator, real_target_pos, target_orientation, return_co
     else:
         return intermediate_states, rgbs
 
-def close_gripper(simulator, handle_pc, object_name=None):
+def close_gripper(simulator, handle_pc, object_name=None, handle_joint_id=None):
     intermediate_states = []
     rgbs = []
     close_steps = 40 
@@ -393,41 +462,39 @@ def close_gripper(simulator, handle_pc, object_name=None):
         points_left_finger = p.getContactPoints(bodyA=simulator.robot.body, linkIndexA=simulator.robot.right_gripper_indices[0], physicsClientId=simulator.id)
         points_right_finger = p.getContactPoints(bodyA=simulator.robot.body, linkIndexA=simulator.robot.right_gripper_indices[1], physicsClientId=simulator.id)
 
-        if points_left_finger:
-            if handle_pc.shape[0] > 0:
-                collision_points_b = [points_left_finger[_][5] for _ in range(len(points_left_finger))]
-                dist_collision_to_handle = scipy.spatial.distance.cdist(collision_points_b, handle_pc).min(axis=1)
-                if np.sum(dist_collision_to_handle < 0.01) > 0:
-                    left_collision = True
-            else:
-                for point in points_left_finger:
-                    target_obj_id = None
-                    if object_name and hasattr(simulator, 'urdf_ids'):
-                         target_obj_id = simulator.urdf_ids.get(object_name)
-                    elif hasattr(simulator, 'obj_id'):
-                         target_obj_id = simulator.obj_id
-                    
-                    if target_obj_id is not None and point[2] == target_obj_id:
-                        left_collision = True
-                        break
+        target_obj_id = None
+        if object_name and hasattr(simulator, 'urdf_ids'):
+            target_obj_id = simulator.urdf_ids.get(object_name)
+        elif hasattr(simulator, 'obj_id'):
+            target_obj_id = simulator.obj_id
 
-        if points_right_finger:
-            if handle_pc.shape[0] > 0:
-                collision_points_b = [points_right_finger[_][5] for _ in range(len(points_right_finger))]
-                dist_collision_to_handle = scipy.spatial.distance.cdist(collision_points_b, handle_pc).min(axis=1)
-                if np.sum(dist_collision_to_handle < 0.01) > 0:
+        if points_left_finger and target_obj_id is not None:
+            # Filter to contacts against the target object.
+            left_contacts = [pt for pt in points_left_finger if pt[1] == target_obj_id]
+            if left_contacts:
+                # Prefer link-level match when available.
+                if handle_joint_id is not None and any(pt[3] == handle_joint_id for pt in left_contacts):
+                    left_collision = True
+                elif handle_pc.shape[0] > 0:
+                    collision_points_b = [pt[5] for pt in left_contacts]
+                    dist_collision_to_handle = scipy.spatial.distance.cdist(collision_points_b, handle_pc).min(axis=1)
+                    if np.sum(dist_collision_to_handle < 0.02) > 0:
+                        left_collision = True
+                else:
+                    left_collision = True
+
+        if points_right_finger and target_obj_id is not None:
+            right_contacts = [pt for pt in points_right_finger if pt[1] == target_obj_id]
+            if right_contacts:
+                if handle_joint_id is not None and any(pt[3] == handle_joint_id for pt in right_contacts):
                     right_collision = True
-            else:
-                for point in points_right_finger:
-                    target_obj_id = None
-                    if object_name and hasattr(simulator, 'urdf_ids'):
-                         target_obj_id = simulator.urdf_ids.get(object_name)
-                    elif hasattr(simulator, 'obj_id'):
-                         target_obj_id = simulator.obj_id
-                    
-                    if target_obj_id is not None and point[2] == target_obj_id:
+                elif handle_pc.shape[0] > 0:
+                    collision_points_b = [pt[5] for pt in right_contacts]
+                    dist_collision_to_handle = scipy.spatial.distance.cdist(collision_points_b, handle_pc).min(axis=1)
+                    if np.sum(dist_collision_to_handle < 0.02) > 0:
                         right_collision = True
-                        break
+                else:
+                    right_collision = True
                 
         if left_collision and right_collision:
             break
@@ -467,6 +534,7 @@ def open_door(simulator, object_name, link_name, handle_joint_id):
     joint_limit = p.getJointInfo(simulator.urdf_ids[object_name], handle_joint_id, physicsClientId=simulator.id)[8:10]
     ori_joint_angle = p.getJointState(simulator.urdf_ids[object_name], handle_joint_id, physicsClientId=simulator.id)[0]
     eef_poses = []
+    joint_angle_traj = []
     timesteps = 100 
     
     ratio = 0.8
@@ -482,10 +550,20 @@ def open_door(simulator, object_name, link_name, handle_joint_id):
         # new_link_pos, new_link_orient is the transformation from link coordinate to world coordinate
         new_eef_pos, new_eef_orient = p.multiplyTransforms(new_link_pos, new_link_orient, eef_in_link[0], eef_in_link[1])
         eef_poses.append([new_eef_pos, new_eef_orient])
+        joint_angle_traj.append(joint_angle)
         
     
     p.resetJointState(simulator.urdf_ids[object_name], handle_joint_id, ori_joint_angle, physicsClientId=simulator.id)
     for t in range(len(eef_poses)):
+        if os.environ.get("ARTICUBOT_KINEMATIC_OPEN_DOOR", "0") == "1":
+            # Optional: kinematically open the door while the robot follows the link motion.
+            # This provides robust demo generation even when grasp/contact is unreliable.
+            p.resetJointState(
+                simulator.urdf_ids[object_name],
+                handle_joint_id,
+                joint_angle_traj[t],
+                physicsClientId=simulator.id,
+            )
         pos, orient = eef_poses[t]
         ik_indices = [_ for _ in range(len(simulator.robot.right_arm_joint_indices))]
         ik_joint_angles = simulator.robot.ik(simulator.robot.right_end_effector, 
@@ -512,24 +590,21 @@ def open_door(simulator, object_name, link_name, handle_joint_id):
     return intermediate_states, rgbs, (final_joint_angle_ratio, final_joint_angle)
 
 def parallel_motion_planning(args):
-    print(f"DEBUG: Entering parallel_motion_planning")
-    debug = False
     np.random.seed(time.time_ns() % 2**32)
-    
-    env_kwargs, object_name, real_target_pos, mp_target_pos, target_orientation, \
+
+    # NOTE: Despite the name, this runs in the *current* simulator.
+    # See approach_object_link_parallel for why we avoid multi-client + Pool.
+    simulator, object_name, real_target_pos, mp_target_pos, target_orientation, \
         handle_pc, handle_joint_id, save_path, ori_simulator_state, \
         it, link_name = args
-        
+
     stage_length = {}
     object_name = object_name.lower()
-    
-    simulator, _ = build_up_env_gen(
-        **env_kwargs
-    )
-    simulator.reset(ori_simulator_state)
-    p.addUserDebugLine([0, 0, 0], [1, 0, 0], [1, 0, 0], lineWidth=2, lifeTime=0, physicsClientId=simulator.id)
-    p.addUserDebugLine([0, 0, 0], [0, 1, 0], [0, 1, 0], lineWidth=2, lifeTime=0, physicsClientId=simulator.id)
-    p.addUserDebugLine([0, 0, 0], [0, 0, 1], [0, 0, 1], lineWidth=2, lifeTime=0, physicsClientId=simulator.id)
+
+    # Restore the simulator to the original pre-grasp state for this candidate.
+    load_env(simulator, state=ori_simulator_state)
+    for _ in range(3):
+        p.stepSimulation(physicsClientId=simulator.id)
 
     intermediate_states = []
     rgbs = []
@@ -541,7 +616,10 @@ def parallel_motion_planning(args):
 
     all_objects = list(simulator.urdf_ids.keys())
     all_objects.remove("robot")
-    obstacles = [simulator.urdf_ids[x] for x in all_objects]
+    # For pre-grasp planning we typically want to allow the end-effector to get very close
+    # to the target object; treating the target object as an obstacle can make collision-free
+    # IK infeasible and causes planning to fail.
+    obstacles = [simulator.urdf_ids[x] for x in all_objects if x != object_name]
     allow_collision_links = []
     cur_eef_pos, cur_eef_orient = simulator.robot.get_pos_orient(simulator.robot.right_end_effector)
     translation_length = np.linalg.norm(mp_target_pos - cur_eef_pos)
@@ -551,23 +629,12 @@ def parallel_motion_planning(args):
     rotation_steps = int(rotation_length / 1.8) + 1
     interpolation_steps = max(translation_steps, rotation_steps)
     
-    if debug:
-        p.addUserDebugPoints([mp_target_pos], [[1, 0, 0]], 12, 0, physicsClientId=simulator.id)
-        p.addUserDebugPoints([real_target_pos], [[1, 0, 0]], 12, 0, physicsClientId=simulator.id)
-    
     res, path, path_translation_length, path_rotation_length = motion_planning(
         simulator, mp_target_pos, target_orientation, obstacles=obstacles, allow_collision_links=allow_collision_links, save_path=save_path, 
-        smooth_path=True, interpolation_num=interpolation_steps)
-    
-    print(f"DEBUG: motion_planning result: {res}")
+        smooth_path=True, interpolation_num=interpolation_steps, ik_pos_tolerance=0.005)
 
     if res:
-        print("DEBUG: motion_planning succeeded")
         stage_length['reach_handle'] = len(path) + len(open_gripper_states)
-        
-        if debug:
-            # import pdb; pdb.set_trace()
-            pass
 
         for idx, q in enumerate(path):
             simulator.robot.set_joint_angles(simulator.robot.right_arm_joint_indices, q)
@@ -576,14 +643,8 @@ def parallel_motion_planning(args):
             state = save_env(simulator)
             intermediate_states.append(state)
 
-        if debug:
-            # import pdb; pdb.set_trace()
-            pass
-
         # reach till contact is made, and get the number of handle points between the two fingers
-        print("DEBUG: Calling reach_till_contact")
         reach_to_concatc_states, reach_to_contact_rgbs = reach_till_contact(simulator, real_target_pos, target_orientation)
-        print(f"DEBUG: reach_till_contact returned {len(reach_to_concatc_states)} states")
         intermediate_states += reach_to_concatc_states
         rgbs += reach_to_contact_rgbs
         stage_length['reach_to_contact'] = len(reach_to_contact_rgbs)
@@ -596,22 +657,18 @@ def parallel_motion_planning(args):
             
             # if not point is being grasped we directly return a failed score
             if score == 0:
-                print("DEBUG: Score is 0 (no points in gripper), returning failure")
-                return (-1, -1), -1, [], [], {}, np.inf, np.inf
+                # This check is a useful heuristic, but can be overly strict for
+                # some custom objects where handle point clouds are sparse/noisy.
+                # Continue the attempt and let downstream collision checks and
+                # opening ratio determine success.
+                pass
         else:
-            print("DEBUG: handle_pc empty, using dummy score 10")
             score = 10 # Dummy score
 
-        # # close gripper
-        if debug:
-            # import pdb; pdb.set_trace()
-            pass
-            
-        print(f"DEBUG: Calling close_gripper with object_name={object_name}")
-        close_states, close_rgbs, left_collision, right_collision = close_gripper(simulator, handle_pc, object_name=object_name)
-        print(f"DEBUG: close_gripper returned. left={left_collision}, right={right_collision}")
+        close_states, close_rgbs, left_collision, right_collision = close_gripper(
+            simulator, handle_pc, object_name=object_name, handle_joint_id=handle_joint_id
+        )
         if not (left_collision and right_collision):
-            print("DEBUG: Collision check failed (score=0)")
             score = 0
         intermediate_states += close_states
         rgbs += close_rgbs
@@ -621,22 +678,13 @@ def parallel_motion_planning(args):
         cprint("iteration {} score {}".format(it, score), "green")
 
         # # pull out following the rotation axis
-        if debug:
-            # import pdb; pdb.set_trace()
-            pass
-            
-        print("DEBUG: Calling open_door")
         open_door_states, open_door_rgbs, final_joint_angle_ratio = open_door(simulator, object_name, link_name, handle_joint_id)
-        print(f"DEBUG: open_door returned. ratio={final_joint_angle_ratio}")
         
         intermediate_states += open_door_states
         rgbs += open_door_rgbs
         stage_length['open_door'] = len(open_door_states)
 
         cprint(f"final joint angle ratio: {final_joint_angle_ratio}", "green")
-        simulator.close()
         return final_joint_angle_ratio, score, intermediate_states, rgbs, stage_length, path_translation_length, path_rotation_length
 
-    print("DEBUG: motion_planning failed")
-    simulator.close()
     return (-1, -1), -1, [], [], {}, np.inf, np.inf

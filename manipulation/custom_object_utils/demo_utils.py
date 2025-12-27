@@ -272,6 +272,14 @@ def _custom_gen_init_state(
     # Get the object's height above ground (z coordinate after placement)
     object_z = init_pos[2]  # This is the proper z after adjust_object_positions
 
+    # Interpret target_position[2] as an additional Z offset (meters).
+    # Default target_position is [0.4, 0.0, 0.0], so behavior stays unchanged.
+    try:
+        target_z_offset = float(target_position[2])
+    except Exception:
+        target_z_offset = 0.0
+    desired_object_z = object_z + target_z_offset
+
     good_init_pos = False
     new_pos = None
     new_orient = None
@@ -281,12 +289,13 @@ def _custom_gen_init_state(
         if time.time() - start_time > 60:  # Internal timeout
             break
 
-        # Randomly sample the position around target_position
-        # Keep the object's z coordinate (already properly adjusted to sit on ground)
+        # Randomly sample the position around target_position.
+        # Keep the object's z coordinate (already properly adjusted to sit on ground),
+        # optionally adding a user-provided z offset.
         new_pos = np.array([
             target_position[0] + np.random.uniform(-0.1, 0.1),
             target_position[1] + np.random.uniform(-0.1, 0.1),
-            object_z  # Preserve the height computed by adjust_object_positions
+            desired_object_z
         ])
 
         # Random orientation around z-axis
@@ -421,6 +430,11 @@ def _custom_gen_init_state(
             saved_pos = [new_pos[0], new_pos[1], 0.0]
             config_dict['center'] = str(tuple(saved_pos))
             config_dict['orientation'] = str(tuple(new_orient))
+            # Keep euler consistent with quaternion (many utilities read 'euler').
+            try:
+                config_dict['euler'] = str(tuple(R.from_quat(np.array(new_orient, dtype=float)).as_euler('xyz').tolist()))
+            except Exception:
+                pass
             config_dict['is_crop_size'] = False
             if 'initial_joint_angles' not in config_dict:
                 config_dict['initial_joint_angles'] = str(tuple(initial_joint_angles))
