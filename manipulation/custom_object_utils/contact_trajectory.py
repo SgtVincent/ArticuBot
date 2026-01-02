@@ -48,57 +48,143 @@ def parse_joint_kinematics_from_urdf(urdf_path: str | Path, joint_name: Optional
     path = Path(urdf_path)
     tree = ET.parse(path)
     root = tree.getroot()
-    
+
+    def _parse_xyz(text: Optional[str]) -> np.ndarray:
+        if not text:
+            return np.zeros(3, dtype=float)
+        return np.array([float(x) for x in text.split()], dtype=float)
+
+    def _parse_rpy(text: Optional[str]) -> np.ndarray:
+        if not text:
+            return np.zeros(3, dtype=float)
+        return np.array([float(x) for x in text.split()], dtype=float)
+
+    def _origin_transform(origin_tag: Optional[ET.Element]) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (R, t) for a URDF <origin> tag."""
+        if origin_tag is None:
+            return np.eye(3, dtype=float), np.zeros(3, dtype=float)
+        xyz = _parse_xyz(origin_tag.get("xyz"))
+        rpy = _parse_rpy(origin_tag.get("rpy"))
+        R_mat = R.from_euler("xyz", rpy).as_matrix()
+        return R_mat, xyz
+
+    # Collect all links and joints to allow expressing joint axes in the URDF root link frame.
+    link_names = {ln.get("name") for ln in root.iter("link") if ln.get("name")}
+    joints: list[dict[str, Any]] = []
+    child_links: set[str] = set()
     for joint in root.iter("joint"):
         j_type = joint.get("type", "fixed").lower()
-        if j_type not in {"revolute", "continuous", "prismatic"}:
-            continue
-        if joint_name and joint.get("name") != joint_name:
-            continue
-            
         parent_tag = joint.find("parent")
         child_tag = joint.find("child")
         if parent_tag is None or child_tag is None:
             continue
-            
-        origin = joint.find("origin")
-        axis = joint.find("axis")
-        limit = joint.find("limit")
-        
-        # Parse origin xyz
-        xyz = [0.0, 0.0, 0.0]
-        if origin is not None:
-            xyz_str = origin.get("xyz")
-            if xyz_str:
-                xyz = [float(x) for x in xyz_str.split()]
-        
-        # Parse axis direction
-        axis_dir = [0.0, 0.0, 1.0]  # Default Z-axis
-        if axis is not None:
-            axis_str = axis.get("xyz")
-            if axis_str:
-                axis_dir = [float(x) for x in axis_str.split()]
-        axis_dir = np.array(axis_dir)
-        if np.linalg.norm(axis_dir) > 0:
-            axis_dir = axis_dir / np.linalg.norm(axis_dir)
-            
-        # Parse limits
-        lower = -0.5
-        upper = 0.5
-        if limit is not None:
-            lower = float(limit.get("lower", "-0.5"))
-            upper = float(limit.get("upper", "0.5"))
-            
-        return JointKinematics(
-            joint_name=joint.get("name", "joint"),
-            joint_type=j_type,
-            axis_origin=np.array(xyz),
-            axis_direction=axis_dir,
-            limit_lower=lower,
-            limit_upper=upper,
-            parent_link=parent_tag.get("link", "base"),
-            child_link=child_tag.get("link", "child"),
+        parent_link = parent_tag.get("link", "")
+        child_link = child_tag.get("link", "")
+        if not parent_link or not child_link:
+            continue
+
+        origin_tag = joint.find("origin")
+        axis_tag = joint.find("axis")
+        limit_tag = joint.find("limit")
+
+        R_o, t_o = _origin_transform(origin_tag)
+        axis_xyz = _parse_xyz(axis_tag.get("xyz") if axis_tag is not None else None)
+        if np.linalg.norm(axis_xyz) < 1e-12:
+            axis_xyz = np.array([0.0, 0.0, 1.0], dtype=float)
+
+        lower = float(limit_tag.get("lower", "-0.5")) if limit_tag is not None else -0.5
+        upper = float(limit_tag.get("upper", "0.5")) if limit_tag is not None else 0.5
+
+        joints.append(
+            {
+                "name": joint.get("name", "joint"),
+                "type": j_type,
+                "parent": parent_link,
+                "child": child_link,
+                "R_origin": R_o,
+                "t_origin": t_o,
+                # axis is expressed in the *joint frame*; convert to parent frame via origin rotation.
+                "axis_parent": R_o @ axis_xyz,
+                "limit_lower": lower,
+                "limit_upper": upper,
+            }
         )
+        child_links.add(child_link)
+
+    # URDF root link: appears as a link but never as any joint's child.
+    root_candidates = sorted([ln for ln in link_names if ln not in child_links])
+    urdf_root_link = root_candidates[0] if root_candidates else "base"
+
+    # Choose the target (non-fixed) joint.
+    selected = None
+    for j in joints:
+        if j["type"] not in {"revolute", "continuous", "prismatic"}:
+            continue
+        if joint_name and j["name"] != joint_name:
+            continue
+        selected = j
+        break
+
+    if selected is None:
+        raise RuntimeError(f"No suitable joint found in {urdf_path}")
+
+    # Compute transform from URDF root link to the selected joint's parent link.
+    # This is critical for assets that insert fixed joints (often with 90deg rotations)
+    # between the URDF root and the articulated joint's parent.
+    child_to_joint: dict[str, dict[str, Any]] = {j["child"]: j for j in joints}
+
+    def _root_to_link_transform(link_name: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (R, t) mapping vectors/points from link frame to URDF root frame.
+
+        Only traverses fixed joints. If a non-fixed joint is encountered on the path,
+        the transform is returned for the reachable portion (conservative fallback).
+        """
+        if link_name == urdf_root_link:
+            return np.eye(3, dtype=float), np.zeros(3, dtype=float)
+
+        chain: list[dict[str, Any]] = []
+        cur = link_name
+        while cur != urdf_root_link:
+            j = child_to_joint.get(cur)
+            if j is None:
+                break
+            # Only fixed joints are safe to apply without knowing configuration.
+            if j["type"] != "fixed":
+                break
+            chain.append(j)
+            cur = j["parent"]
+
+        # Compose in forward direction (root -> ... -> link).
+        R_acc = np.eye(3, dtype=float)
+        t_acc = np.zeros(3, dtype=float)
+        for j in reversed(chain):
+            # joint origin provides parent->child transform at zero configuration.
+            R_step = j["R_origin"]
+            t_step = j["t_origin"]
+            t_acc = R_acc @ t_step + t_acc
+            R_acc = R_acc @ R_step
+        return R_acc, t_acc
+
+    R_root_parent, t_root_parent = _root_to_link_transform(selected["parent"])
+
+    axis_dir_parent = np.asarray(selected["axis_parent"], dtype=float)
+    axis_dir_parent = axis_dir_parent / max(np.linalg.norm(axis_dir_parent), 1e-12)
+    axis_origin_parent = np.asarray(selected["t_origin"], dtype=float)
+
+    axis_origin_root = R_root_parent @ axis_origin_parent + t_root_parent
+    axis_dir_root = R_root_parent @ axis_dir_parent
+    axis_dir_root = axis_dir_root / max(np.linalg.norm(axis_dir_root), 1e-12)
+
+    return JointKinematics(
+        joint_name=str(selected["name"]),
+        joint_type=str(selected["type"]),
+        axis_origin=axis_origin_root,
+        axis_direction=axis_dir_root,
+        limit_lower=float(selected["limit_lower"]),
+        limit_upper=float(selected["limit_upper"]),
+        parent_link=str(selected["parent"]),
+        child_link=str(selected["child"]),
+    )
     
     raise RuntimeError(f"No suitable joint found in {urdf_path}")
 

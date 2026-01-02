@@ -1,8 +1,7 @@
 """Integrated inverse map demo utilities for direct sampling approach.
 
 This module provides process-wrapped initial state generation using the
-integrated inverse map algorithm. Unlike rejection sampling (heuristic and
-ik_filtered methods), this approach:
+integrated inverse map algorithm. Unlike rejection sampling (heuristic methods), this approach:
 
 1. Pre-computes a distribution over object placements based on trajectory reachability
 2. Samples directly from this distribution

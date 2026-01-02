@@ -161,6 +161,75 @@ def plot_trajectory_with_scores(
     return fig
 
 
+def plot_trajectory_with_scores_on_ax(
+    ax,  # Axes3D
+    trajectory: Sequence[Tuple[np.ndarray, np.ndarray]],
+    scores: Sequence[float],
+    object_pos: np.ndarray = None,
+    title: str = "Trajectory",
+    highlight_waypoint: int | None = None,
+    draw_frames_every: int = 5,
+) -> None:
+    """Plot trajectory on a provided 3D axis.
+
+    This is a subplot-friendly variant of `plot_trajectory_with_scores()`.
+    """
+    # Extract positions
+    positions = np.array([wp[1] for wp in trajectory], dtype=float)
+
+    # Trajectory line
+    if len(positions) > 1:
+        ax.plot(
+            positions[:, 0],
+            positions[:, 1],
+            positions[:, 2],
+            'k-',
+            alpha=0.25,
+            linewidth=1.0,
+        )
+
+    # Waypoints
+    for i, ((R_wp, p_wp), score) in enumerate(zip(trajectory, scores)):
+        color = score_to_color(float(score))
+        if highlight_waypoint is not None and i == int(highlight_waypoint):
+            ax.scatter(p_wp[0], p_wp[1], p_wp[2], c=[(0.0, 1.0, 1.0)], s=220, marker='x', linewidths=3)
+            ax.scatter(p_wp[0], p_wp[1], p_wp[2], c=[color], s=80, alpha=0.9)
+        else:
+            ax.scatter(p_wp[0], p_wp[1], p_wp[2], c=[color], s=35, alpha=0.7)
+
+        # Draw coordinate frame for every Nth waypoint, and always for highlighted
+        if draw_frames_every > 0 and (i % int(draw_frames_every) == 0 or (highlight_waypoint is not None and i == int(highlight_waypoint))):
+            frame_scale = 0.05 if (highlight_waypoint is not None and i == int(highlight_waypoint)) else 0.03
+            create_coordinate_frame(ax, np.asarray(R_wp, dtype=float), np.asarray(p_wp, dtype=float), scale=frame_scale, alpha=0.45)
+
+    # Object marker
+    if object_pos is not None:
+        obj = np.asarray(object_pos, dtype=float)
+        ax.scatter(obj[0], obj[1], obj[2], c='purple', s=150, marker='*')
+
+    # Robot base marker
+    ax.scatter(0, 0, 0, c='black', s=80, marker='^')
+
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.set_title(title)
+
+    # Axis limits
+    all_pts = np.vstack([positions, np.zeros((1, 3), dtype=float)])
+    if object_pos is not None:
+        all_pts = np.vstack([all_pts, np.asarray(object_pos, dtype=float).reshape(1, 3)])
+    center = all_pts.mean(axis=0)
+    max_range = float(np.max(np.abs(all_pts - center)) * 1.2)
+    ax.set_xlim(center[0] - max_range, center[0] + max_range)
+    ax.set_ylim(center[1] - max_range, center[1] + max_range)
+    ax.set_zlim(0, max(center[2] + max_range, 1.0))
+    try:
+        ax.set_box_aspect([1, 1, 1])
+    except Exception:
+        pass
+
+
 def plot_integrated_inverse_map(
     x_grid: np.ndarray,
     y_grid: np.ndarray,
@@ -231,6 +300,39 @@ def plot_integrated_inverse_map(
     
     plt.tight_layout()
     return fig
+
+
+def plot_integrated_inverse_map_on_ax(
+    ax,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    theta_grid: np.ndarray,
+    scores: np.ndarray,
+    theta_index: int = 0,
+    object_pos: np.ndarray = None,
+    title: str = "Integrated Inverse Map",
+):
+    """Plot an integrated inverse map slice on a provided 2D axis.
+
+    Returns the image handle for colorbar attachment.
+    """
+    score_slice = scores[:, :, theta_index].T
+    X, Y = np.meshgrid(x_grid, y_grid)
+    im = ax.pcolormesh(X, Y, score_slice, cmap='RdYlGn', vmin=0, vmax=1, shading='auto')
+    ax.scatter(0, 0, c='black', s=80, marker='^', label='Robot Base', zorder=5)
+    if object_pos is not None:
+        ax.scatter(float(object_pos[0]), float(object_pos[1]), c='purple', s=160, marker='*', label='Sampled Object', zorder=6)
+
+    theta_deg = float(np.degrees(theta_grid[theta_index]))
+    max_score = float(np.max(score_slice))
+    mean_score = float(np.mean(score_slice[score_slice > 0])) if np.any(score_slice > 0) else 0.0
+    n_valid = int(np.sum(score_slice > 0))
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_title(f"{title}\nθ = {theta_deg:.1f}° | max={max_score:.3f}, mean(>0)={mean_score:.3f}, valid={n_valid}")
+    ax.set_aspect('equal')
+    ax.legend(loc='upper right')
+    return im
 
 
 def compute_per_waypoint_scores_grid(
@@ -379,6 +481,45 @@ def plot_per_waypoint_heatmap(
     return fig
 
 
+def plot_per_waypoint_heatmap_on_ax(
+    ax,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    theta_grid: np.ndarray,
+    waypoint_scores: np.ndarray,
+    waypoint_idx: int,
+    theta_index: int = 0,
+    object_pos: np.ndarray = None,
+    ee_pos_world: np.ndarray = None,
+    title: str = "Per-Waypoint Inverse Map",
+):
+    """Plot per-waypoint heatmap on a provided 2D axis.
+
+    Returns the image handle for colorbar attachment.
+    """
+    score_slice = waypoint_scores[:, :, theta_index].T
+    X, Y = np.meshgrid(x_grid, y_grid)
+    im = ax.pcolormesh(X, Y, score_slice, cmap='RdYlGn', vmin=0, vmax=1, shading='auto')
+    ax.scatter(0, 0, c='black', s=80, marker='^', label='Robot Base', zorder=5)
+    if object_pos is not None:
+        ax.scatter(float(object_pos[0]), float(object_pos[1]), c='purple', s=160, marker='*', label='Object', zorder=6)
+    if ee_pos_world is not None:
+        ax.scatter(float(ee_pos_world[0]), float(ee_pos_world[1]), c='cyan', s=110, marker='x', label=f'EE wp {waypoint_idx}', zorder=7)
+
+    n_reachable = int(np.sum(score_slice > 0))
+    total_cells = int(score_slice.size)
+    coverage = (n_reachable / max(total_cells, 1)) * 100.0
+    theta_deg = float(np.degrees(theta_grid[theta_index]))
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_title(
+        f"{title}\nWaypoint {int(waypoint_idx)} | θ={theta_deg:.1f}° | Coverage: {coverage:.1f}% ({n_reachable}/{total_cells})"
+    )
+    ax.set_aspect('equal')
+    ax.legend(loc='upper right')
+    return im
+
+
 def fig_to_array(fig: Figure) -> np.ndarray:
     """Convert matplotlib figure to numpy array.
     
@@ -391,12 +532,22 @@ def fig_to_array(fig: Figure) -> np.ndarray:
     # Draw the figure
     fig.canvas.draw()
     
-    # Convert to numpy array using renderer
+    # Convert to numpy array using the canvas buffer.
+    # Prefer buffer_rgba() when available (Agg backends), fallback to tostring_rgb().
     w, h = fig.canvas.get_width_height()
-    buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img = buf.reshape(h, w, 3)
-    
-    return img
+    buffer_rgba = getattr(fig.canvas, "buffer_rgba", None)
+    if callable(buffer_rgba):
+        buf = np.asarray(buffer_rgba(), dtype=np.uint8)
+        img = buf.reshape(h, w, 4)[:, :, :3].copy()
+        return img
+
+    tostring_rgb = getattr(fig.canvas, "tostring_rgb", None)
+    if callable(tostring_rgb):
+        buf = np.frombuffer(bytes(tostring_rgb()), dtype=np.uint8)
+        img = buf.reshape(h, w, 3)
+        return img
+
+    raise RuntimeError("Unsupported matplotlib canvas: cannot extract RGB buffer")
 
 
 def compute_waypoint_scores(
@@ -490,17 +641,39 @@ def create_comprehensive_debug_gif(
     
     print(f"  [DEBUG VIS] Waypoint reachability at sampled pose: {n_reachable}/{total_waypoints}")
     
-    # Frame 1: Overview with 3D trajectory
-    fig = plot_trajectory_with_scores(
-        trajectory_world, waypoint_scores, object_pos, object_quat,
-        title=f"Full Trajectory - {n_reachable}/{total_waypoints} Waypoints Reachable"
+    # Frame 1: Overview (trajectory + best-theta integrated map)
+    fig = plt.figure(figsize=(18, 8))
+    ax_traj = fig.add_subplot(1, 2, 1, projection='3d')
+    ax_map = fig.add_subplot(1, 2, 2)
+
+    plot_trajectory_with_scores_on_ax(
+        ax_traj,
+        trajectory_world,
+        waypoint_scores,
+        object_pos=object_pos,
+        title=f"Trajectory Overview ({n_reachable}/{total_waypoints} reachable)",
+        highlight_waypoint=None,
     )
-    frames.append(fig_to_array(fig))
-    plt.close(fig)
-    
+
     # Find best theta index (one with highest integrated score)
     theta_sums = np.sum(integrated_scores, axis=(0, 1))
-    best_theta_idx = np.argmax(theta_sums)
+    best_theta_idx = int(np.argmax(theta_sums))
+
+    im = plot_integrated_inverse_map_on_ax(
+        ax_map,
+        x_grid,
+        y_grid,
+        theta_grid,
+        integrated_scores,
+        theta_index=best_theta_idx,
+        object_pos=object_pos,
+        title="Integrated Map (best θ)",
+    )
+    fig.colorbar(im, ax=ax_map, shrink=0.85, aspect=20).set_label('Reachability Score')
+    fig.suptitle("Integrated Inverse Sampling Debug", fontsize=14)
+    plt.tight_layout()
+    frames.append(fig_to_array(fig))
+    plt.close(fig)
     
     # Per-waypoint heatmaps (optional, but helpful for debugging)
     if include_per_waypoint and sampler is not None and hasattr(sampler, 'rmap'):
@@ -519,16 +692,36 @@ def create_comprehensive_debug_gif(
         
         for wp_idx in waypoint_indices:
             ee_pos = trajectory_world[wp_idx][1]
-            
-            fig = plot_per_waypoint_heatmap(
-                x_grid, y_grid, theta_grid,
+
+            # Side-by-side: trajectory overview (highlight this waypoint) + heatmap
+            fig = plt.figure(figsize=(18, 8))
+            ax_traj = fig.add_subplot(1, 2, 1, projection='3d')
+            ax_map = fig.add_subplot(1, 2, 2)
+
+            plot_trajectory_with_scores_on_ax(
+                ax_traj,
+                trajectory_world,
+                waypoint_scores,
+                object_pos=object_pos,
+                title=f"Trajectory (highlight wp {wp_idx})",
+                highlight_waypoint=int(wp_idx),
+            )
+
+            im = plot_per_waypoint_heatmap_on_ax(
+                ax_map,
+                x_grid,
+                y_grid,
+                theta_grid,
                 per_wp_scores[wp_idx],
-                waypoint_idx=wp_idx,
-                theta_index=best_theta_idx,
+                waypoint_idx=int(wp_idx),
+                theta_index=int(best_theta_idx),
                 object_pos=object_pos,
                 ee_pos_world=ee_pos,
-                title="Per-Waypoint Inverse Reachability"
+                title="Per-Waypoint Inverse Reachability",
             )
+            fig.colorbar(im, ax=ax_map, shrink=0.85, aspect=20).set_label('Reachable (1) / Not Reachable (0)')
+            fig.suptitle(f"Waypoint {wp_idx} heatmap (θ=best)", fontsize=14)
+            plt.tight_layout()
             frames.append(fig_to_array(fig))
             plt.close(fig)
     
@@ -537,11 +730,33 @@ def create_comprehensive_debug_gif(
     theta_indices = np.linspace(0, len(theta_grid) - 1, n_theta_frames, dtype=int)
     
     for theta_idx in theta_indices:
-        fig = plot_integrated_inverse_map(
-            x_grid, y_grid, theta_grid, integrated_scores,
-            theta_index=theta_idx, object_pos=object_pos,
-            title="Integrated Inverse Map (Aggregated)"
+        # Side-by-side: trajectory overview + integrated map slice
+        fig = plt.figure(figsize=(18, 8))
+        ax_traj = fig.add_subplot(1, 2, 1, projection='3d')
+        ax_map = fig.add_subplot(1, 2, 2)
+
+        plot_trajectory_with_scores_on_ax(
+            ax_traj,
+            trajectory_world,
+            waypoint_scores,
+            object_pos=object_pos,
+            title="Trajectory Overview",
+            highlight_waypoint=None,
         )
+
+        im = plot_integrated_inverse_map_on_ax(
+            ax_map,
+            x_grid,
+            y_grid,
+            theta_grid,
+            integrated_scores,
+            theta_index=int(theta_idx),
+            object_pos=object_pos,
+            title="Integrated Inverse Map (Aggregated)",
+        )
+        fig.colorbar(im, ax=ax_map, shrink=0.85, aspect=20).set_label('Reachability Score')
+        fig.suptitle(f"Integrated map slice θ-index {int(theta_idx)}", fontsize=14)
+        plt.tight_layout()
         frames.append(fig_to_array(fig))
         plt.close(fig)
     

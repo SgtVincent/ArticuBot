@@ -113,7 +113,7 @@ The on-demand system:
 The demo generation script supports **two sampling methods**:
 
 1. **Heuristic (Original)**: Random object placement + robot configuration sampling
-2. **IK-Filtered (New)**: Uses inverse kinematics map to pre-filter object placements
+2. **Integrated Inverse (New)**: Direct sampling from an integrated inverse map
 
 ### Using the Heuristic Method (Original)
 
@@ -130,15 +130,18 @@ python manipulation/gen_demo_custom.py \
     --timeout-exec 300
 ```
 
-### Using the IK-Filtered Method (New Algorithm)
+### Integrated Inverse Method (recommended)
 
-The IK-filtered method uses RM4D reachability maps to pre-filter object placements, significantly improving sampling efficiency:
+The integrated inverse method computes an aggregated inverse reachability
+distribution along the manipulation trajectory and samples object poses
+from that distribution directly. This reduces wasted attempts and is the
+recommended approach over naive rejection sampling.
 
 ```bash
 python manipulation/gen_demo_custom.py \
     --asset-dir data/custom_objects/sim_microwave_good \
-    --exp-name sim_microwave_demos_ikfiltered \
-    --sampling-method ik_filtered \
+    --exp-name sim_microwave_demos_integrated \
+    --sampling-method integrated_inverse \
     --rm4d-map data/rm4d_franka_1M.npy \
     --num-to-generate 100 \
     --max-try-times 300 \
@@ -146,7 +149,7 @@ python manipulation/gen_demo_custom.py \
     --timeout-exec 300
 ```
 
-> **Note**: The IK-filtered method requires a pre-computed RM4D reachability map. See [RM4D Setup](#rm4d-setup) for details.
+> **Note**: The integrated inverse method requires a pre-computed RM4D reachability map. See [RM4D Setup](#rm4d-setup) for details.
 
 ### Key Arguments
 
@@ -154,7 +157,7 @@ python manipulation/gen_demo_custom.py \
 |----------|---------|-------------|
 | `--asset-dir` | Required | Path to object asset folder |
 | `--exp-name` | `debug_custom` | Experiment name for output |
-| `--sampling-method` | `heuristic` | Sampling method: `heuristic` or `ik_filtered` |
+| `--sampling-method` | `heuristic` | Sampling method: `heuristic` or `integrated_inverse` |
 | `--num-to-generate` | 10 | Number of successful demos to collect |
 | `--max-try-times` | 200 | Maximum attempts before giving up |
 | `--center-jitter` | 0.05 | Position randomization (meters) |
@@ -166,14 +169,11 @@ python manipulation/gen_demo_custom.py \
 | `--timeout-init` | 60.0 | Timeout for init state generation |
 | `--timeout-exec` | 300.0 | Timeout for demo execution |
 
-#### IK-Filtered Method Specific Arguments
+#### RM4D / Integrated Inverse Arguments
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--rm4d-map` | None | Path to RM4D reachability map (.npy) |
-| `--object-traj` | None | Pre-computed object-frame trajectory (npz) |
-| `--rm4d-coverage-thresh` | 0.8 | Minimum trajectory coverage |
-| `--rm4d-reachability-thresh` | 0.5 | Minimum reachability fraction |
 | `--approach-distance` | 0.15 | Gripper approach distance (meters) |
 | `--target-ratio` | 0.8 | Target opening ratio for manipulation |
 
@@ -189,18 +189,18 @@ for each demo attempt:
     # Problem: Many attempts wasted on infeasible placements
 ```
 
-#### IK-Filtered Method (New)
+#### Integrated Inverse Method (New)
 ```python
 for each demo attempt:
     1. Sample randomized object config (scale, joint angles)
     2. Predict grasps for the object state
     3. Compute in-contact trajectory in object frame
-    4. Sample object poses, filtering with IK map along trajectory
-    5. Execute manipulation on filtered poses
-    # Advantage: Rejects infeasible placements BEFORE motion planning
+    4. Aggregate reachability along trajectory and form a pose distribution
+    5. Sample poses from the distribution and execute on feasible ones
+    # Advantage: Samples from feasible set directly, fewer wasted attempts
 ```
 
-The IK-filtered method typically achieves **2-5x higher success rate** per attempt because it uses the RM4D inverse reachability map to reject infeasible object placements before attempting expensive motion planning.
+Using RM4D-based pre-filtering can improve success rate per attempt by rejecting infeasible placements before attempting expensive motion planning.
  
 
 
@@ -227,7 +227,7 @@ experiment/<exp_name>/
 
 ## RM4D Setup
 
-The IK-filtered method requires a pre-computed RM4D (Reachability Map 4D) reachability map. The map encodes inverse reachability information for the robot arm.
+The RM4D (Reachability Map 4D) reachability map encodes inverse reachability information for the robot arm and is used by the integrated inverse method.
 
 ### Using Pre-computed Maps
 
@@ -365,12 +365,10 @@ python visualize_trajectories.py \
 
 | File | Description |
 |------|-------------|
-| `manipulation/gen_demo_custom.py` | Main demo generation script (supports heuristic & IK-filtered) |
+| `manipulation/gen_demo_custom.py` | Main demo generation script (supports heuristic & integrated_inverse) |
 | `manipulation/generate_base_config_from_urdf_custom.py` | Config generator |
 | `manipulation/custom_object_utils/demo_utils.py` | Demo utilities + on-demand GraspGen |
-| `manipulation/custom_object_utils/demo_utils_ik_filtered.py` | IK-filtered sampling utilities |
 | `manipulation/custom_object_utils/contact_trajectory.py` | In-contact trajectory computation |
-| `manipulation/custom_object_utils/ik_filtered_sampling.py` | IK-filtered sampling algorithm |
 | `manipulation/custom_object_utils/graspgen_client.py` | GraspGen Docker client |
 | `manipulation/custom_object_utils/object_utils.py` | URDF/annotation utilities |
 | `manipulation/rm4d_filtering/trajectory_filter.py` | RM4D trajectory reachability filter |

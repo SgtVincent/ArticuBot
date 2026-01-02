@@ -221,9 +221,20 @@ def integrated_sample_initial_state(
     
     # Get object's z-coordinate after placement (already computed by env.reset)
     init_pos, init_orient = p.getBasePositionAndOrientation(object_id, physicsClientId=env.id)
-    # Apply z-offset to elevate object (e.g., for table height)
-    object_z = init_pos[2] + object_z_offset
-    print(f"  Object z-height: {init_pos[2]:.3f} + offset {object_z_offset:.3f} = {object_z:.3f}")
+
+    # Keep semantics consistent with heuristic sampling:
+    # - config.target_position[2] acts as an additional Z offset
+    # - object_z_offset remains as an explicit override (legacy/extra)
+    try:
+        target_z_offset = float(config.target_position[2])
+    except Exception:
+        target_z_offset = 0.0
+
+    object_z = float(init_pos[2]) + float(target_z_offset) + float(object_z_offset)
+    print(
+        f"  Object z-height: {float(init_pos[2]):.3f} + target_z_offset {target_z_offset:.3f} "
+        f"+ object_z_offset {float(object_z_offset):.3f} = {object_z:.3f}"
+    )
     
     start_time = time.time()
     
@@ -446,22 +457,25 @@ def load_or_compute_trajectory(
     Returns:
         Full manipulation trajectory in object frame.
     """
-    # Try to load joint kinematics from mobility or URDF
+    # Try to load joint kinematics from URDF first.
+    # Rationale: many generated URDFs insert fixed joints (often with 90deg rotations)
+    # between the URDF root and the articulated joint's parent link. URDF parsing can
+    # account for these constant frame offsets, while mobility_v2.json typically cannot.
     mobility_path = asset_dir / "mobility_v2.json"
     urdf_files = list(asset_dir.glob("*.urdf"))
-    
+
     joint_kin = None
-    if mobility_path.exists():
-        try:
-            joint_kin = parse_joint_kinematics_from_mobility(mobility_path)
-        except Exception:
-            pass  # Will try URDF next
-    
-    if joint_kin is None and urdf_files:
+    if urdf_files:
         try:
             joint_kin = parse_joint_kinematics_from_urdf(urdf_files[0])
         except Exception:
-            pass  # Will use fallback
+            joint_kin = None
+
+    if joint_kin is None and mobility_path.exists():
+        try:
+            joint_kin = parse_joint_kinematics_from_mobility(mobility_path)
+        except Exception:
+            joint_kin = None
     
     if joint_kin is None:
         # Fall back to straight line approach trajectory

@@ -480,82 +480,160 @@ class IntegratedInverseMapSampler:
         base_euler: np.ndarray,
         traj_obj_tf: np.ndarray,
     ) -> np.ndarray:
-        """Vectorized score computation for all grid cells.
-        
-        Uses the RM4D API directly to avoid floating-point precision issues
-        in the canonical base position computation.
-        
-        For 'mean' aggregation with coverage_threshold, the score is the
-        fraction of reachable waypoints, set to 0 if below threshold.
+        """Compute scores for all grid cells.
+
+        For each grid cell (object placement), we check if ALL waypoints in the
+        trajectory are reachable from the robot at origin. The key insight is that
+        we evaluate EVERY waypoint for EVERY grid cell consistently.
+
+        Aggregation methods:
+        - 'mean': Score = fraction of reachable waypoints. Apply coverage_threshold.
+        - 'min': Score = 1 only if ALL waypoints are reachable (AND logic).
+        - 'product': Same as 'min' for binary reachability.
+
+        Out-of-bounds handling:
+        - If a waypoint's EE pose falls outside the RM4D map (z or theta out of
+          range), that waypoint counts as UNREACHABLE for all grid cells.
+        - If the canonical base position (x*, y*) falls outside the map for a
+          specific grid cell, that waypoint is UNREACHABLE for that cell.
+
+        This ensures consistent evaluation across all waypoints and all grid cells.
         """
         nx, ny, ntheta = len(x_grid), len(y_grid), len(theta_grid)
-        n_waypoints = traj_obj_tf.shape[0]
+        n_waypoints = int(traj_obj_tf.shape[0])
+
+        if n_waypoints == 0:
+            return np.zeros((nx, ny, ntheta), dtype=np.float32)
+
+        # Precompute XY mesh for broadcasting (world/base frame).
+        x_mesh, y_mesh = np.meshgrid(x_grid, y_grid, indexing="ij")  # (nx, ny)
+
+        # RM4D map parameters
+        voxel_res = float(self.rmap.voxel_res)
+        xy_min = float(self.rmap.xy_limits[0])
+        z_min = float(self.rmap.z_limits[0])
+        z_max = float(self.rmap.z_limits[1])
+        theta_min = float(self.rmap.theta_limits[0])
+        theta_res = float(self.rmap.theta_res)
+        n_bins_z = int(self.rmap.n_bins_z)
+        n_bins_theta = int(self.rmap.n_bins_theta)
+        n_bins_xy = int(self.rmap.n_bins_xy)
+
+        # For 'mean', count reachable waypoints per cell.
+        # For 'min'/'product', track if ALL waypoints so far are reachable.
+        reachable_counts = np.zeros((nx, ny, ntheta), dtype=np.int32)
         
-        # Initialize scores based on aggregation method
-        if self.aggregation_method == 'mean':
-            # Track count of reachable waypoints per cell
-            reachable_counts = np.zeros((nx, ny, ntheta), dtype=np.int32)
-        else:
-            # For min/product, start with 1
-            scores = np.ones((nx, ny, ntheta), dtype=np.float32)
-        
-        # Pre-compute rotation matrices for all theta values
-        R_wo_all = np.zeros((ntheta, 3, 3), dtype=np.float64)
-        for ith, theta in enumerate(theta_grid):
+        # For 'min'/'product', we need to track: has this cell seen any
+        # unreachable waypoint? We'll use a "still valid" mask that starts True
+        # and becomes False when any waypoint is unreachable.
+        all_reachable = np.ones((nx, ny, ntheta), dtype=bool)
+
+        # Pre-compute object rotation matrices for all sampled yaw bins.
+        R_bo_all = np.zeros((ntheta, 3, 3), dtype=np.float64)
+        for ith, yaw_delta in enumerate(theta_grid):
             euler = base_euler.copy()
-            euler[2] += theta
-            R_wo_all[ith] = Rotation.from_euler('xyz', euler).as_matrix()
-        
-        # Build 4x4 object transforms for each (x, y, theta) combo
-        # and check reachability for each waypoint
-        debug_first = True  # Print debug info for first waypoint only
+            euler[2] += yaw_delta
+            R_bo_all[ith] = Rotation.from_euler("xyz", euler).as_matrix()
+
+        # Iterate over waypoints and yaw bins; vectorize over XY grid.
         for wp_idx in range(n_waypoints):
-            tf_obj = traj_obj_tf[wp_idx]  # (4, 4) waypoint in object frame
-            
+            tf_obj = traj_obj_tf[wp_idx]
+            R_o = tf_obj[:3, :3]
+            p_o = tf_obj[:3, 3]
+
             for ith in range(ntheta):
-                R_wo = R_wo_all[ith]
+                # Early exit optimization: if all cells are already unreachable
+                # for min/product, skip this theta bin.
+                if self.aggregation_method != "mean":
+                    if not np.any(all_reachable[:, :, ith]):
+                        continue
+
+                R_bo = R_bo_all[ith]
+
+                # EE orientation in base frame for this waypoint and sampled yaw.
+                R_b = R_bo @ R_o
+                rz = R_b[:, 2]
+                rz_x, rz_y, rz_z = float(rz[0]), float(rz[1]), float(rz[2])
+
+                # Theta index depends only on EE z-axis tilt.
+                theta_val = float(np.arccos(np.clip(rz_z, -1.0, 1.0)))
+                if np.isclose(theta_val, np.pi):
+                    theta_idx = n_bins_theta - 1
+                else:
+                    theta_idx = int((theta_val - theta_min) / theta_res)
                 
-                for ix, x in enumerate(x_grid):
-                    for iy, y in enumerate(y_grid):
-                        if self.aggregation_method != 'mean' and scores[ix, iy, ith] == 0.0:
-                            # Already marked unreachable, skip (only for min/product)
-                            continue
-                        
-                        # Build object-to-world transform T_wo
-                        T_wo = np.eye(4)
-                        T_wo[:3, :3] = R_wo
-                        T_wo[:3, 3] = [x, y, z_height]
-                        
-                        # Transform waypoint to world frame: T_world = T_wo @ T_obj
-                        tf_world = T_wo @ tf_obj
-                        
-                        # Debug: print first waypoint's world position (only once per compute)
-                        if debug_first and wp_idx == 0 and ith == 0 and ix == len(x_grid)//2 and iy == len(y_grid)//2:
-                            print(f"  [DEBUG] Waypoint 0 at grid center: obj_frame_z={tf_obj[2,3]:.3f}, "
-                                  f"world_z={tf_world[2,3]:.3f}, z_height={z_height:.3f}")
-                            debug_first = False
-                        
-                        # Check reachability using RM4D API
-                        try:
-                            indices = self.rmap.get_indices_for_ee_pose(tf_world)
-                            is_reachable = float(self.rmap.is_reachable(indices))
-                        except (IndexError, ValueError):
-                            is_reachable = 0.0
-                        
-                        # Aggregate score
-                        if self.aggregation_method == 'mean':
-                            reachable_counts[ix, iy, ith] += int(is_reachable)
-                        elif self.aggregation_method == 'min':
-                            scores[ix, iy, ith] = min(scores[ix, iy, ith], is_reachable)
-                        else:  # product
-                            scores[ix, iy, ith] *= is_reachable
-        
-        # For mean aggregation, compute final scores with coverage threshold
-        if self.aggregation_method == 'mean':
-            scores = reachable_counts.astype(np.float32) / n_waypoints
-            # Apply coverage threshold
-            scores[scores < self.coverage_threshold] = 0.0
-        
+                # Check if theta is out of RM4D bounds
+                theta_out_of_bounds = (theta_idx < 0 or theta_idx >= n_bins_theta)
+
+                # EE position offset from object translation (x, y are variable, z fixed).
+                p_off = R_bo @ p_o
+                p_z = float(z_height + p_off[2])
+                z_idx = int((p_z - z_min) / voxel_res)
+                
+                # Check if z is out of RM4D bounds
+                z_out_of_bounds = (p_z < z_min or p_z >= z_max or 
+                                   z_idx < 0 or z_idx >= n_bins_z)
+
+                # If theta or z is out of bounds, this waypoint is unreachable
+                # for ALL grid cells in this theta bin.
+                if theta_out_of_bounds or z_out_of_bounds:
+                    # For min/product: mark all cells as having an unreachable waypoint
+                    if self.aggregation_method != "mean":
+                        all_reachable[:, :, ith] = False
+                    # For mean: reachable_counts stays 0 for this waypoint (already 0)
+                    continue
+
+                # 2D rotation used by RM4D canonical base position.
+                psi = float(np.arctan2(rz_y, rz_x))
+                cpsi = float(np.cos(psi))
+                spsi = float(np.sin(psi))
+
+                # EE position in base frame for all XY grid points.
+                p_x = x_mesh + float(p_off[0])
+                p_y = y_mesh + float(p_off[1])
+
+                # Canonical base position (x*, y*) = rot2d @ [-p_x, -p_y]
+                x_star = -(cpsi * p_x + spsi * p_y)
+                y_star = (spsi * p_x - cpsi * p_y)
+
+                x_idx = ((x_star - xy_min) / voxel_res).astype(np.int32)
+                y_idx = ((y_star - xy_min) / voxel_res).astype(np.int32)
+
+                # Check which cells have valid (x*, y*) indices
+                valid_xy = (
+                    (x_idx >= 0)
+                    & (x_idx < n_bins_xy)
+                    & (y_idx >= 0)
+                    & (y_idx < n_bins_xy)
+                )
+
+                # Look up reachability in RM4D map
+                map_slice = self.rmap.map[z_idx, theta_idx]  # (n_bins_xy, n_bins_xy)
+                
+                # Initialize reachable to False (unreachable by default)
+                reachable = np.zeros((nx, ny), dtype=bool)
+                
+                # Only cells with valid indices can be reachable
+                if np.any(valid_xy):
+                    reachable[valid_xy] = map_slice[x_idx[valid_xy], y_idx[valid_xy]]
+
+                # Update aggregation
+                if self.aggregation_method == "mean":
+                    # Count reachable waypoints
+                    reachable_counts[:, :, ith] += reachable.astype(np.int32)
+                else:
+                    # For min/product: a cell becomes unreachable if ANY waypoint 
+                    # is unreachable. Use AND logic.
+                    all_reachable[:, :, ith] &= reachable
+
+        # Compute final scores
+        if self.aggregation_method == "mean":
+            scores = reachable_counts.astype(np.float32) / float(n_waypoints)
+            scores[scores < float(self.coverage_threshold)] = 0.0
+        else:
+            # For min/product: score is 1.0 if all waypoints reachable, else 0.0
+            scores = all_reachable.astype(np.float32)
+
         return scores
     
     def _score_object_pose(

@@ -8,8 +8,8 @@ reachable?) and inverse queries (where should the base be for a given EE pose?).
 Example usage:
     python scripts/build_rm4d_map.py --robot franka --samples 1000000 --output data/rm4d_franka_1M.npy
 
-For trajectory filtering during demo generation, use with gen_demo_custom.py:
-    python manipulation/gen_demo_custom.py ... --rm4d-map data/rm4d_franka_1M.npy --object-traj <traj.npz>
+For use with integrated inverse demo generation, pass the map to `gen_demo_custom.py`:
+    python manipulation/gen_demo_custom.py ... --sampling-method integrated_inverse --rm4d-map data/rm4d_franka_1M.npy
 """
 from __future__ import annotations
 

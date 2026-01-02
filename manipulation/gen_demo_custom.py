@@ -3,20 +3,21 @@
 
 This script implements two sampling methods:
 1. HEURISTIC (original): Random object placement + robot configuration sampling
-2. IK_FILTERED (new): Uses inverse kinematics map to pre-filter object placements
+2. INTEGRATED_INVERSE (new): Direct sampling from an integrated inverse map
 
-The new IK-filtered method computes the expected gripper trajectory in object
-frame and uses RM4D reachability maps to reject infeasible placements before
-attempting motion planning, significantly improving sampling efficiency.
+The integrated inverse method computes a distribution over object poses by
+aggregating reachability along the manipulation trajectory and samples from
+that distribution directly, improving sampling efficiency over naive
+rejection sampling.
 
 Usage:
     # Heuristic method (original)
-    python gen_demo_custom.py --asset-dir data/custom_objects/my_object \\
+    python gen_demo_custom.py --asset-dir data/custom_objects/my_object \
         --sampling-method heuristic
     
-    # IK-filtered method (new)
-    python gen_demo_custom.py --asset-dir data/custom_objects/my_object \\
-        --sampling-method ik_filtered \\
+    # Integrated inverse method (new)
+    python gen_demo_custom.py --asset-dir data/custom_objects/my_object \
+        --sampling-method integrated_inverse \
         --rm4d-map data/rm4d_franka_1M.npy
 """
 from __future__ import annotations
@@ -51,7 +52,6 @@ from manipulation.custom_object_utils.demo_utils import (
 class SamplingMethod(Enum):
     """Available sampling methods for initial state generation."""
     HEURISTIC = "heuristic"  # Original random sampling method
-    IK_FILTERED = "ik_filtered"  # IK map rejection sampling
     INTEGRATED_INVERSE = "integrated_inverse"  # Direct sampling from integrated inverse map
 
 
@@ -79,9 +79,8 @@ def parse_args() -> argparse.Namespace:
     
     # Sampling method selection
     parser.add_argument("--sampling-method", type=str, default="heuristic",
-                        choices=["heuristic", "ik_filtered", "integrated_inverse"],
-                        help="Sampling method: 'heuristic' (original), 'ik_filtered' (rejection), "
-                             "or 'integrated_inverse' (direct sampling)")
+                        choices=["heuristic", "integrated_inverse"],
+                        help="Sampling method: 'heuristic' (original) or 'integrated_inverse' (direct sampling)")
     
     # Distance parameters
     parser.add_argument("--near-distance", type=float, default=0.15,
@@ -133,15 +132,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--object-z-offset", type=float, default=0.0,
                         help="Z-offset to elevate object above ground (e.g., 0.7 for table height)")
     
-    # RM4D/IK filtering parameters (for ik_filtered method)
+    # RM4D parameters (used by integrated inverse sampling)
     parser.add_argument("--rm4d-map", type=pathlib.Path, default=None,
                         help="Path to RM4D reachability map (.npy)")
-    parser.add_argument("--object-traj", type=pathlib.Path, default=None,
-                        help="Optional pre-computed object-frame gripper trajectory (npz with R, p)")
-    parser.add_argument("--rm4d-coverage-thresh", type=float, default=0.8,
-                        help="Minimum coverage required to accept a sampled object pose")
-    parser.add_argument("--rm4d-reachability-thresh", type=float, default=0.5,
-                        help="Minimum reachability fraction required to accept a sampled object pose")
     
     # Integrated inverse map parameters
     parser.add_argument("--xy-resolution", type=float, default=0.02,
@@ -158,7 +151,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-score-threshold", type=float, default=0.1,
                         help="Minimum reachability score threshold for valid poses")
     
-    # Trajectory computation parameters (for ik_filtered method)
+    # Trajectory computation parameters (used by integrated_inverse and general methods)
     parser.add_argument("--approach-distance", type=float, default=0.15,
                         help="Approach distance for gripper (meters)")
     parser.add_argument("--target-ratio", type=float, default=0.8,
@@ -239,19 +232,11 @@ def validate_and_prepare_args(args: argparse.Namespace) -> None:
 
     if args.rm4d_map is not None:
         args.rm4d_map = pathlib.Path(args.rm4d_map).expanduser().resolve(strict=False)
-    if args.object_traj is not None:
-        args.object_traj = pathlib.Path(args.object_traj).expanduser().resolve(strict=False)
 
     if not args.annotation_path.exists():
         raise FileNotFoundError(f"Annotation JSON not found at {args.annotation_path}")
     if not args.urdf_path.exists():
         raise FileNotFoundError(f"URDF path not found at {args.urdf_path}")
-    
-    # Validate IK-filtered specific requirements
-    if args.sampling_method == "ik_filtered":
-        if args.rm4d_map is None:
-            cprint("WARNING: --rm4d-map not provided for ik_filtered method. "
-                   "IK filtering will be disabled, falling back to heuristic within the method.", "yellow")
     
     # Validate integrated_inverse specific requirements
     if args.sampling_method == "integrated_inverse":
@@ -380,10 +365,8 @@ def run_heuristic_generation(args: argparse.Namespace,
             near_distance=args.near_distance,
             far_distance=args.far_distance,
             timeout=args.timeout_init,
-            rm4d_map_path=None,  # Disable IK filtering for heuristic
+            rm4d_map_path=None,  # Disable RM4D-based filtering for heuristic
             object_traj_path=None,
-            coverage_threshold=args.rm4d_coverage_thresh,
-            reachability_threshold=args.rm4d_reachability_thresh,
         )
         
         if not success_init:
@@ -413,97 +396,6 @@ def run_heuristic_generation(args: argparse.Namespace,
         attempt += 1
     
     cprint(f"\nHEURISTIC method completed: {total_success} demos from {attempt} attempts", "green")
-
-
-def run_ik_filtered_generation(args: argparse.Namespace,
-                                experiment_path: pathlib.Path,
-                                predicted_grasps: Optional[Tuple[np.ndarray, np.ndarray]]) -> None:
-    """Run demo generation using the IK-filtered (new) method.
-    
-    This method implements the new algorithm:
-    1. Sample randomized object config (scale, joint angles)
-    2. Predict grasps for the object state
-    3. Compute in-contact trajectory in object frame
-    4. Sample object poses with IK map filtering along trajectory
-    5. Execute manipulation on filtered poses
-    
-    Args:
-        args: Parsed command line arguments.
-        experiment_path: Path to experiment directory.
-        predicted_grasps: Pre-loaded grasps or None for on-demand generation.
-    """
-    cprint("Using IK_FILTERED sampling method (new algorithm)", "green")
-
-    from manipulation.custom_object_utils.demo_utils_ik_filtered import (
-        custom_gen_init_state_ik_filtered,
-    )
-    
-    num_existing = get_current_num_demos(str(experiment_path))
-    cprint(f"Existing successful demos: {num_existing}", "yellow")
-
-    attempt = 0
-    total_success = num_existing
-    
-    while total_success < args.num_to_generate and attempt < args.max_try_times:
-        # Step 1: Sample randomized object config
-        variant_path = create_variant_config(
-            str(args.config_path),
-            args.asset_dir,
-            attempt,
-            args._handle_name,
-            args.annotation_path,
-            args.center_jitter,
-            args.size_scale,
-            urdf_path=args.urdf_path,
-            predicted_grasps=predicted_grasps,
-            target_position=tuple(args.target_position),
-        )
-        
-        cprint(f"[IK_FILTERED] Attempt {attempt+1}/{args.max_try_times}: {variant_path.name}", "green")
-        
-        # Generate initial state using IK-filtered method
-        success_init = custom_gen_init_state_ik_filtered(
-            str(variant_path),
-            args.env_name,
-            args.render,
-            near_distance=args.near_distance,
-            far_distance=args.far_distance,
-            timeout=args.timeout_init,
-            rm4d_map_path=str(args.rm4d_map) if args.rm4d_map else None,
-            coverage_threshold=args.rm4d_coverage_thresh,
-            reachability_threshold=args.rm4d_reachability_thresh,
-            approach_distance=args.approach_distance,
-            target_ratio=args.target_ratio,
-            asset_dir=str(args.asset_dir),
-        )
-        
-        if not success_init:
-            cprint("Failed to generate initial state (IK-filtered)", "red")
-            attempt += 1
-            continue
-
-        handled, total_success = _handle_init_only(args, total_success)
-        if handled:
-            attempt += 1
-            continue
-            
-        success_exec = custom_execute(
-            str(variant_path),
-            args.env_name,
-            str(args.asset_dir),
-            str(experiment_path),
-            timeout=args.timeout_exec
-        )
-        
-        if success_exec:
-            total_success += 1
-            cprint(f"Success! Total demos: {total_success}/{args.num_to_generate}", "green")
-        else:
-            cprint("Execution failed", "red")
-            
-        attempt += 1
-    
-    cprint(f"\nIK_FILTERED method completed: {total_success} demos from {attempt} attempts", "green")
 
 
 def run_integrated_inverse_generation(args: argparse.Namespace,
@@ -638,8 +530,6 @@ def main() -> None:
     # Select and run sampling method
     if args.sampling_method == "heuristic":
         run_heuristic_generation(args, experiment_path, predicted_grasps)
-    elif args.sampling_method == "ik_filtered":
-        run_ik_filtered_generation(args, experiment_path, predicted_grasps)
     elif args.sampling_method == "integrated_inverse":
         run_integrated_inverse_generation(args, experiment_path, predicted_grasps)
     else:
