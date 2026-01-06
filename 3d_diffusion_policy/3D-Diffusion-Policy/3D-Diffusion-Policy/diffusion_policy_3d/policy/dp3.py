@@ -231,7 +231,13 @@ class DP3(BasePolicy):
             }
             nobs = self.normalizer.normalize(nobs)
         else:
-            nobs = obs_dict
+            # For act3d, still normalize keys that have normalizers (like agent_pos or gripper_pcd)
+            nobs = {}
+            for key, value in obs_dict.items():
+                if key in self.normalizer.params_dict:
+                    nobs[key] = self.normalizer[key].normalize(value)
+                else:
+                    nobs[key] = value
 
         if self.scale_scene_by_pcd:
             max_scale = torch.max(torch.norm(nobs['point_cloud'][...,:3], dim=-1))
