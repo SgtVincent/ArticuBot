@@ -15,6 +15,7 @@ import numpy as np
 import pybullet as p
 from gym import spaces
 from scipy.spatial.distance import cdist
+from scipy.spatial.transform import Rotation as R
 
 from manipulation.robogen_wrapper import RobogenPointCloudWrapper
 from manipulation.utils import get_pc, rotation_transfer_6D_to_matrix, rotation_transfer_matrix_to_6D
@@ -96,6 +97,7 @@ class RobogenPointCloudWrapperCustom(RobogenPointCloudWrapper):
                  noise_real_world_pcd=False,
                  real_world_camera=False,
                  skip_goal_loading=True,
+                  skip_env_info: bool = False,
             ):
         """Initialize the custom wrapper.
         
@@ -114,6 +116,7 @@ class RobogenPointCloudWrapperCustom(RobogenPointCloudWrapper):
         self._handle_name = handle_name
         self._asset_dir_hint = asset_dir_hint
         self._skip_goal_loading = skip_goal_loading
+        self._skip_env_info = skip_env_info
         
         # Initialize without calling parent __init__ to avoid stage_lengths loading
         # We replicate the parent initialization logic here but skip the goal loading
@@ -233,6 +236,54 @@ class RobogenPointCloudWrapperCustom(RobogenPointCloudWrapper):
             self.goal_gripper_pcd = None
 
         self.only_object = only_object
+
+    def reset(self, **kwargs):
+        if "act3d_goal" in self.observation_mode:
+            self.grasped_handle = False
+
+        self._env.reset(**kwargs)
+
+        if not self._skip_env_info:
+            self._env._get_info()
+
+        self.time_step = 0
+        if "goal" in self.observation_mode:
+            self.grasped_handle = False
+        return self._get_observation(only_object=self.only_object)
+
+    def step(self, action, render=True):
+        # Mirror RobogenPointCloudWrapper.step, but optionally skip env info/reward
+        # to support environments where handle discovery assets are unavailable.
+        pos, orient = self._env.robot.get_pos_orient(self._env.robot.right_end_effector)
+
+        pos = pos + np.array(action[:3])
+
+        current_rotate_matrix = np.array(p.getMatrixFromQuaternion(orient)).reshape(3, 3)
+        delta_orient = action[3:9]
+        delta_rotate_matrix = rotation_transfer_6D_to_matrix(delta_orient)
+        after_rotate_matrix = current_rotate_matrix @ delta_rotate_matrix
+        orient = R.from_matrix(after_rotate_matrix).as_quat()
+        euler = p.getEulerFromQuaternion(orient)
+
+        cur_joint_angle = p.getJointState(
+            self._env.robot.body, self._env.robot.right_gripper_indices[0], physicsClientId=self._env.id
+        )
+        target_joint_angle = action[9] + cur_joint_angle[0]
+
+        low_level_action = pos.tolist() + list(euler) + [target_joint_angle]
+        self._env.take_direct_action(low_level_action)
+
+        if self._skip_env_info:
+            reward = 0.0
+            info = {}
+        else:
+            reward, _success = self._env.compute_reward()
+            info = self._env._get_info()
+
+        done = getattr(self._env, 'time_step', 0) >= self.horizon
+        obs = self._get_observation(render=render, only_object=self.only_object)
+        self.time_step += 1
+        return obs, reward, done, info
         
         # Try to extract handle_name from environment config if not provided
         if self._handle_name is None:
