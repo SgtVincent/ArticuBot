@@ -21,6 +21,7 @@ from manipulation.rm4d_filtering import (
 from manipulation.utils import build_up_env_gen
 from manipulation.utils import parse_center
 from manipulation.custom_object_utils.object_utils import (
+    detect_asset_version,
     determine_reward_asset_path,
     serialize_vector,
 )
@@ -36,6 +37,60 @@ from manipulation.custom_object_utils.graspgen_client import (
 )
 
 
+def get_graspgen_host_root_for_asset(asset_dir: pathlib.Path) -> str:
+    """
+    #TODO: Call the dockerized graspgen client to do path conversion instead of hardcoding logic here.
+    #TODO: Maybe mount docker volume to ArticuBot repo root instead of just GraspGenModels for easier path mapping.
+    Compute the GraspGen host root path for path conversion.
+    
+    For the Docker container to access assets, they must be under the 
+    GraspGenModels directory (or a symlink to it). This function returns
+    the appropriate host_graspgen_root based on asset layout.
+    
+    Expected Docker mount: /code/GraspGenModels -> GraspGen/GraspGenModels
+    With symlink: GraspGenModels/custom_objects_v2 -> ArticuBot/data/custom_objects_v2
+    
+    Args:
+        asset_dir: Path to the asset directory.
+        
+    Returns:
+        The host path that maps to /code/GraspGenModels in the container.
+    """
+    asset_dir = pathlib.Path(asset_dir).resolve()
+    version = detect_asset_version(asset_dir)
+    
+    # Look for GraspGenModels in the path hierarchy
+    # This handles both direct assets and symlinked assets
+    for parent in [asset_dir] + list(asset_dir.parents):
+        if parent.name == "GraspGenModels":
+            # Found GraspGenModels, return its parent + GraspGenModels
+            return str(parent)
+        # Also check for custom_objects_v2/sim/<object> pattern
+        if parent.name == "custom_objects_v2":
+            # Return path to GraspGenModels which should contain custom_objects_v2 symlink
+            # Typical structure: GraspGen/GraspGenModels/custom_objects_v2 (symlink)
+            graspgen_root = pathlib.Path("/home/junting/repo/articulated_objects/GraspGen/GraspGenModels")
+            if graspgen_root.exists():
+                return str(graspgen_root)
+    
+    # Fallback: for v1 assets, asset is typically in custom_objects under GraspGenModels
+    # v1: GraspGenModels/custom_objects/sim_microwave_good
+    # v2: GraspGenModels/custom_objects_v2/sim/microwave_7167
+    if version == 2:
+        # For v2, asset_dir is like: .../custom_objects_v2/sim/microwave_7167
+        # We need to find the root that contains custom_objects_v2
+        # Return the parent of custom_objects_v2 as the graspgen root
+        for parent in asset_dir.parents:
+            if parent.name == "data":
+                # This is ArticuBot/data, but GraspGen mounts GraspGenModels
+                # Return the GraspGenModels path that has symlink to this
+                return "/home/junting/repo/articulated_objects/GraspGen/GraspGenModels"
+    else:
+        # v1: go up 3 levels from URDF parent
+        # URDF at asset_dir/*.urdf, parent.parent.parent is GraspGenModels
+        return str(asset_dir.parent.parent)
+
+
 def _resolve_relative_path(path_value: pathlib.Path | str, base_dir: pathlib.Path) -> pathlib.Path:
     """Return an absolute path, interpreting relative inputs against ``base_dir``."""
     candidate = pathlib.Path(path_value).expanduser()
@@ -49,16 +104,23 @@ def resolve_relative_path(path_value: pathlib.Path | str, base_dir: pathlib.Path
 
 
 def parse_config_metadata(config_path: str) -> Tuple[str, str, str, str]:
+    """Parse object name, handle name, annotation path, and solution path from config.
+    
+    Returns:
+        Tuple of (object_name, handle_name, annotation_path, solution_path)
+    """
     config = yaml.safe_load(open(config_path, "r"))
     object_name = None
     handle_name = None
     solution_path = None
     annotation_path = None
+    urdf_path = None
     for block in config:
         if "name" in block:
             object_name = block["name"].lower()
             handle_name = block.get("handle_name", "handle").lower()
             annotation_path = block.get("annotation_path")
+            urdf_path = block.get("urdf_path")
         if "solution_path" in block:
             solution_path = block["solution_path"]
     if object_name is None or solution_path is None:
@@ -378,8 +440,7 @@ def _custom_gen_init_state(
 
             # Prepare temporary URDF folder with joint states recorded
             # Place intermediate data inside the object's artifact folder so
-            # the container mount (data/custom_objects -> /code/GraspGenModels/custom_objects)
-            # can access it.
+            # the container mount can access it.
             import shutil, uuid
             urdf_parent = pathlib.Path(urdf_path).resolve().parent
             tmp_dir = str(urdf_parent / f"_tmp_{uuid.uuid4().hex[:8]}")
@@ -387,8 +448,19 @@ def _custom_gen_init_state(
             try:
                 prepared = prepare_urdf_with_joint_state(urdf_path, joint_states, tmp_dir, scale=1.0)
                 # Configure GraspGenConfig so host<->container path mapping matches runtime mounts
-                # Host GraspGenModels root is 3 levels up from URDF (urdf -> object_folder -> custom_objects -> GraspGenModels)
-                host_root = str(pathlib.Path(urdf_path).resolve().parent.parent.parent)
+                # Detect asset version and compute correct GraspGen root path
+                # For v2 assets: URDF is in urdf/ subfolder, asset_dir is 1 level up
+                urdf_path_obj = pathlib.Path(urdf_path).resolve()
+                version = detect_asset_version(urdf_path_obj.parent.parent) if urdf_path_obj.parent.name == "urdf" else 1
+                
+                if version == 2:
+                    # v2: URDF at asset_dir/urdf/*.urdf, asset_dir is urdf_parent.parent
+                    asset_dir = urdf_path_obj.parent.parent
+                else:
+                    # v1: URDF at asset_dir/*.urdf
+                    asset_dir = urdf_path_obj.parent
+                
+                host_root = get_graspgen_host_root_for_asset(asset_dir)
                 gg_cfg = GraspGenConfig(
                     host_graspgen_root=host_root,
                     container_graspgen_root="/code/GraspGenModels",
@@ -407,7 +479,8 @@ def _custom_gen_init_state(
                 predicted_grasp_pos = pos.tolist()
                 predicted_grasp_orn = quat.tolist()
                 shutil.rmtree(tmp_dir)
-            except Exception:
+            except Exception as e:
+                print(f"[GraspGen] Exception during on-demand grasp generation: {e}")
                 try:
                     shutil.rmtree(tmp_dir)
                 except Exception:

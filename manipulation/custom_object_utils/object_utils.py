@@ -35,6 +35,61 @@ def _ensure_path(path_like: os.PathLike | str) -> Path:
     return path_like if isinstance(path_like, Path) else Path(path_like)
 
 
+def detect_asset_version(asset_dir: os.PathLike | str) -> int:
+    """Detect whether the asset uses v1 or v2 layout.
+    
+    Returns:
+        1 for v1 layout (URDF at root, mesh/ at root)
+        2 for v2 layout (URDF in urdf/, mesh in urdf/mesh/)
+    """
+    asset_path = _ensure_path(asset_dir)
+    
+    # Check for v2 layout: urdf/ subfolder exists with .urdf file
+    urdf_subdir = asset_path / "urdf"
+    if urdf_subdir.exists() and urdf_subdir.is_dir():
+        for entry in urdf_subdir.iterdir():
+            if entry.suffix.lower() == ".urdf" and entry.is_file():
+                return 2
+    
+    # Default to v1
+    return 1
+
+
+def load_scale_from_file(asset_dir: os.PathLike | str) -> Optional[float]:
+    """Load scale factor from scale.txt if present (v2 format).
+    
+    Returns:
+        Scale factor as float, or None if not found.
+    """
+    asset_path = _ensure_path(asset_dir)
+    
+    # Try v2 location: urdf/scale.txt
+    scale_path = asset_path / "urdf" / "scale.txt"
+    if not scale_path.exists():
+        # Also try root level
+        scale_path = asset_path / "scale.txt"
+    
+    if scale_path.exists():
+        try:
+            with scale_path.open("r") as f:
+                return float(f.read().strip())
+        except (ValueError, IOError):
+            return None
+    return None
+
+
+def get_urdf_parent_dir(asset_dir: os.PathLike | str) -> Path:
+    """Get the directory containing the URDF file.
+    
+    Returns urdf/ subfolder for v2, or asset_dir for v1.
+    """
+    asset_path = _ensure_path(asset_dir)
+    version = detect_asset_version(asset_path)
+    if version == 2:
+        return asset_path / "urdf"
+    return asset_path
+
+
 def parse_float_list(text: Optional[str], length: int = 3, default: Optional[Sequence[float]] = None) -> List[float]:
     """Parse a whitespace-separated list of floats."""
     if text is None:
@@ -56,12 +111,27 @@ def parse_float_list(text: Optional[str], length: int = 3, default: Optional[Seq
 
 
 def find_first_urdf(folder: os.PathLike | str) -> Path:
-    """Return the first ``*.urdf`` file inside ``folder``."""
+    """Return the first ``*.urdf`` file inside ``folder``.
+    
+    Supports both v1 (URDF at root) and v2 (URDF in urdf/ subfolder) structures:
+    - v1: <folder>/*.urdf
+    - v2: <folder>/urdf/*.urdf
+    """
     folder_path = _ensure_path(folder)
+    
+    # First try v1 layout: URDF at root level
     for entry in sorted(folder_path.iterdir()):
         if entry.suffix.lower() == ".urdf" and entry.is_file():
             return entry
-    raise FileNotFoundError(f"No URDF file found under {folder_path}")
+    
+    # Then try v2 layout: URDF in urdf/ subfolder
+    urdf_subdir = folder_path / "urdf"
+    if urdf_subdir.exists() and urdf_subdir.is_dir():
+        for entry in sorted(urdf_subdir.iterdir()):
+            if entry.suffix.lower() == ".urdf" and entry.is_file():
+                return entry
+    
+    raise FileNotFoundError(f"No URDF file found under {folder_path} or {folder_path}/urdf")
 
 
 def collect_mesh_info(base_dir: Path, urdf_path: Path, link_name: str):
@@ -455,9 +525,21 @@ def compute_center_and_euler(tree: ET.ElementTree) -> Tuple[np.ndarray, np.ndarr
     return center.astype(float), euler.astype(float)
 
 
-def compute_object_size(urdf_path: Path, override: Optional[float] = None) -> float:
+def compute_object_size(urdf_path: Path, override: Optional[float] = None, asset_dir: Optional[Path] = None) -> float:
+    """Compute object size from meshes or scale.txt.
+    
+    For v2 assets, tries to load size from urdf/scale.txt first.
+    """
     if override is not None:
         return float(override)
+    
+    # Try loading scale from scale.txt (v2 format)
+    if asset_dir is not None:
+        scale = load_scale_from_file(asset_dir)
+        if scale is not None:
+            return float(scale)
+    
+    # Fall back to mesh-based estimation
     tree = ET.parse(urdf_path)
     mesh_paths = collect_mesh_paths(urdf_path.parent, tree)
     size = estimate_size_from_meshes(mesh_paths)
@@ -655,11 +737,19 @@ def determine_reward_asset_path(dest_dir: Path) -> str:
         return dest_real_path.as_posix()
 
 
-def compute_config_metadata(urdf_path: os.PathLike | str, size_override: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, float]:
+def compute_config_metadata(urdf_path: os.PathLike | str, size_override: Optional[float] = None, asset_dir: Optional[os.PathLike | str] = None) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Compute center, euler, and size metadata from URDF.
+    
+    Args:
+        urdf_path: Path to URDF file.
+        size_override: Optional manual size override.
+        asset_dir: Optional asset directory for v2 scale.txt lookup.
+    """
     path = _ensure_path(urdf_path)
     tree = ET.parse(path)
     center, euler = compute_center_and_euler(tree)
-    size = compute_object_size(path, override=size_override)
+    asset_path = _ensure_path(asset_dir) if asset_dir else None
+    size = compute_object_size(path, override=size_override, asset_dir=asset_path)
     return center, euler, size
 
 
@@ -736,6 +826,9 @@ def load_predicted_grasps(grasp_path: os.PathLike | str) -> Tuple[np.ndarray, np
 
 __all__ = [
     "find_first_urdf",
+    "detect_asset_version",
+    "load_scale_from_file",
+    "get_urdf_parent_dir",
     "compute_config_metadata",
     "compute_object_size",
     "determine_reward_asset_path",

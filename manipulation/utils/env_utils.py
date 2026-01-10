@@ -304,7 +304,7 @@ def build_up_env_random(task_config=None, env_name='articulated', render=False,
     if randomize_initial_joint_angle:
         try:
             handle_joint_id = env.get_handle_joint_id()
-        except (FileNotFoundError, KeyError, AttributeError):
+        except Exception:
             # Fallback: find first revolute joint
             num_joints = p.getNumJoints(object_id, physicsClientId=env.id)
             for i in range(num_joints):
@@ -483,6 +483,11 @@ def build_up_env_random(task_config=None, env_name='articulated', render=False,
     # Final settlement
     for _ in range(10):
         p.stepSimulation(physicsClientId=env.id)
+    
+    # Update init_state to capture the randomized configuration
+    # This ensures that env.reset() restores this randomized state instead of the default config state
+    if hasattr(env, 'init_state'):
+        env.init_state = save_env(env)
     
     return env, save_config
 

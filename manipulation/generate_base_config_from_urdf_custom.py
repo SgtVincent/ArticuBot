@@ -8,6 +8,10 @@ Compared to ``generate_base_config_from_urdf.py`` this script additionally:
 * converts an affordance annotation (3D bbox) into ``parts_render/<id><handle>.obj``
 * stores the handle metadata inside the generated config so downstream scripts can
   register the correct handle name.
+
+Supports both v1 and v2 asset layouts:
+- v1: URDF and mesh/ at root level
+- v2: URDF and mesh/ inside urdf/ subfolder, with optional scale.txt
 """
 from __future__ import annotations
 
@@ -21,12 +25,14 @@ import yaml
 
 from manipulation.custom_object_utils.object_utils import (
     compute_config_metadata,
+    detect_asset_version,
     determine_reward_asset_path,
     ensure_annotation_copy,
     ensure_handle_mesh_from_annotation,
     ensure_mobility_file,
     extract_joint_metadata,
     find_first_urdf,
+    get_urdf_parent_dir,
     quaternion_from_euler,
     sanitize_object_name,
     serialize_vector,
@@ -55,6 +61,7 @@ def build_config_dict(
     handle_name: str,
     solution_path: Path,
     annotation_path: Path,
+    urdf_path: Path,
     use_table: bool,
 ) -> list[dict]:
     # For custom objects, center represents the target world placement position
@@ -77,6 +84,7 @@ def build_config_dict(
             "type": "urdf",
             "handle_name": handle_name,
             "annotation_path": str(annotation_path),
+            "urdf_path": str(urdf_path),
         },
         {"solution_path": str(solution_path)},
     ]
@@ -84,8 +92,8 @@ def build_config_dict(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate base_config for custom URDF")
-    parser.add_argument("--asset-folder", default="data/URDF_with_affordance", help="Folder containing URDF, mesh/, annotation.json")
-    parser.add_argument("--output-root", default="data/custom_objects", help="Root folder for processed assets")
+    parser.add_argument("--asset-folder", default="data/URDF_with_affordance", help="Folder containing URDF, mesh/, annotation.json (supports both v1 and v2 layouts)")
+    parser.add_argument("--output-root", default="data/custom_objects_v2", help="Root folder for processed assets")
     parser.add_argument("--dataset-name", default=None, help="Name for the processed asset folder")
     parser.add_argument("--annotation", default=None, help="Path to annotation.json (defaults to <asset-folder>/annotation.json)")
     parser.add_argument("--joint-name", default=None, help="Name of revolute/prismatic joint to treat as handle")
@@ -97,26 +105,53 @@ def main() -> None:
     parser.add_argument("--overwrite-assets", action="store_true", help="Delete target folder before copying assets")
     parser.add_argument("--overwrite-support", action="store_true", help="Regenerate mobility/handle meshes even if they exist")
     parser.add_argument("--use-table", action="store_true", help="Set use_table: true in the config")
+    parser.add_argument("--in-place", action="store_true", help="Generate config in the source folder instead of copying to output-root")
     args = parser.parse_args()
 
     src_dir = Path(args.asset_folder).expanduser().resolve()
     if not src_dir.exists():
         raise FileNotFoundError(f"Asset folder not found: {src_dir}")
+    
+    # Detect asset version and find URDF
+    asset_version = detect_asset_version(src_dir)
+    print(f"Detected asset version: v{asset_version}")
+    
     urdf_path = find_first_urdf(src_dir)
+    print(f"Found URDF: {urdf_path}")
 
     dataset_name = args.dataset_name or src_dir.name
-    dst_root = Path(args.output_root).expanduser()
-    dst_dir = (dst_root / dataset_name)
-
-    copy_asset_tree(src_dir, dst_dir, overwrite=args.overwrite_assets)
-
-    annotation_src = Path(args.annotation).expanduser().resolve() if args.annotation else (src_dir / "annotation.json")
+    
+    # Determine destination directory
+    if args.in_place:
+        dst_dir = src_dir
+    else:
+        dst_root = Path(args.output_root).expanduser()
+        dst_dir = (dst_root / dataset_name)
+        copy_asset_tree(src_dir, dst_dir, overwrite=args.overwrite_assets)
+    
+    # Find annotation (try root level first, then standard locations)
+    annotation_src = None
+    if args.annotation:
+        annotation_src = Path(args.annotation).expanduser().resolve()
+    else:
+        # Try root level first (both v1 and v2)
+        annotation_src = src_dir / "annotation.json"
+        if not annotation_src.exists():
+            # v2 might have it at root level
+            annotation_src = src_dir / "annotation.json"
+    
     if not annotation_src.exists():
         raise FileNotFoundError(f"Annotation JSON not found at {annotation_src}")
     annotation_dst = ensure_annotation_copy(annotation_src, dst_dir)
 
-    # Recompute joint metadata from the copied URDF
-    target_urdf = dst_dir / urdf_path.name
+    # Compute target URDF path in destination directory
+    # Preserve the relative path structure (e.g., urdf/object.urdf for v2)
+    urdf_rel = urdf_path.relative_to(src_dir)
+    target_urdf = dst_dir / urdf_rel
+    
+    if not target_urdf.exists():
+        raise FileNotFoundError(f"Expected URDF not found at {target_urdf}")
+    
     joint_info = extract_joint_metadata(target_urdf, joint_name=args.joint_name)
     handle_name = (args.handle_name or joint_info["child_link"]).lower()
 
@@ -130,7 +165,7 @@ def main() -> None:
         overwrite=args.overwrite_support,
     )
 
-    center, euler, size = compute_config_metadata(target_urdf, size_override=args.size)
+    center, euler, size = compute_config_metadata(target_urdf, size_override=args.size, asset_dir=dst_dir)
     reward_asset_path = determine_reward_asset_path(dst_dir)
     object_name = args.object_name or sanitize_object_name(dataset_name)
 
@@ -143,6 +178,7 @@ def main() -> None:
         handle_name,
         dst_dir,
         annotation_dst,
+        target_urdf,
         use_table=args.use_table,
     )
 
@@ -152,6 +188,7 @@ def main() -> None:
 
     print("Saved base config to", base_config_path)
     print("  Asset folder:", dst_dir)
+    print("  Asset version:", f"v{asset_version}")
     print("  URDF file:", target_urdf)
     print("  Handle name:", handle_name)
     print("  Reward asset path:", reward_asset_path)

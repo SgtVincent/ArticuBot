@@ -697,6 +697,8 @@ class SimpleEnvBase(gym.Env):
 
         self.control_rgbs = []
         action_index = 0
+        ik_max_iterations = getattr(self, 'ik_max_iterations', 10000)
+        ik_residual_threshold = getattr(self, 'ik_residual_threshold', 1e-4)
         for i, agent in enumerate(self.agents):
             agent_action_len = self.base_action_space.shape[0] 
             action = np.copy(actions[action_index:action_index+agent_action_len])
@@ -725,7 +727,14 @@ class SimpleEnvBase(gym.Env):
                         new_joint_angles = original_joint_angles[ik_indices] + np.random.uniform(-0.3, 0.3, size=len(ik_indices))
                         self.robot.set_joint_angles(ik_indices, new_joint_angles)
 
-                    ik_joint_angles = self.robot.ik(self.robot.right_end_effector, rescaled_pos, rescaled_orient, ik_indices=ik_indices, max_iterations=10000, residualThreshold=1e-4)
+                    ik_joint_angles = self.robot.ik(
+                        self.robot.right_end_effector,
+                        rescaled_pos,
+                        rescaled_orient,
+                        ik_indices=ik_indices,
+                        max_iterations=ik_max_iterations,
+                        residualThreshold=ik_residual_threshold,
+                    )
                     
                     if np.all(ik_joint_angles >= self.robot.ik_lower_limits[ik_indices]) and np.all(ik_joint_angles <= self.robot.ik_upper_limits[ik_indices]):
                         bullet_solutions.append(ik_joint_angles)

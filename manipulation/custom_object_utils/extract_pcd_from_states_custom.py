@@ -230,19 +230,24 @@ def extract_pc_states_for_all_trajectories_custom(pool_args):
                 print(f"Warning: Failed to randomize cameras for {experiment}: {e}")
         
         # Check if handle is visible
+        # Note: For custom objects with sparse handle annotations (e.g., only 4 annotation points),
+        # the visibility check often fails. We set min_handle_visibility to 0 to skip this check
+        # for custom objects and rely on the demo generation quality instead.
+        min_handle_visibility = 0  # Skip visibility check for custom objects
         try:
             handle_visibility = simulator.check_handle_observed_in_pc()
+            print(f"Handle visibility for {experiment}: {handle_visibility}")
 
             # If the default cameras barely see the handle, try one automatic
             # camera search pass before skipping the trajectory.
-            if handle_visibility < 5 and not args.randomize_camera:
+            if min_handle_visibility > 0 and handle_visibility < min_handle_visibility and not args.randomize_camera:
                 try:
                     simulator.reset_random_cameras()
                     handle_visibility = simulator.check_handle_observed_in_pc()
                 except Exception as e:
                     print(f"Warning: Failed to auto-adjust cameras for {experiment}: {e}")
 
-            if handle_visibility < 5:
+            if min_handle_visibility > 0 and handle_visibility < min_handle_visibility:
                 print(
                     f"Handle not observed in the point cloud for {experiment}, visibility={handle_visibility}"
                 )

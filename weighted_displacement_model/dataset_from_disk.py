@@ -125,8 +125,24 @@ def get_dataset_from_pickle(all_obj_paths=None, beg_ratio=0, end_ratio=0.9, use_
             real_world_camera_500_paths = [os.path.join("/scratch/yufeiw2/dp3_demo_real_world_noise_pcd_clean_distorted_goal", x) for x in real_world_camera_500_paths]
             all_obj_paths = non_real_world_camera_500_paths + real_world_camera_500_paths
         elif num_train_objects == 'custom':
-            all_subfolders = sorted(os.listdir(dataset_prefix))
-            all_obj_paths = [os.path.join(dataset_prefix, x) for x in all_subfolders if os.path.isdir(os.path.join(dataset_prefix, x))]
+            # Custom datasets can be provided in two layouts:
+            # 1) Multi-object root: <dataset_prefix>/<object_id>/... (each object dir contains timestamp episode dirs)
+            # 2) Single-object root: <dataset_prefix>/... (contains meta_info.json + timestamp episode dirs)
+            #
+            # The training scripts often pass a single-object root (layout #2). In that case we must treat
+            # `dataset_prefix` itself as the only obj_path; otherwise we mistakenly treat each episode dir
+            # as an obj_path, and then interpret step '*.pkl' files as episode subfolders.
+            meta_info_path = os.path.join(dataset_prefix, 'meta_info.json')
+            all_demo_path = os.path.join(dataset_prefix, 'all_demo_path.txt')
+            if os.path.isfile(meta_info_path) or os.path.isfile(all_demo_path):
+                all_obj_paths = [dataset_prefix]
+            else:
+                all_subfolders = sorted(os.listdir(dataset_prefix))
+                all_obj_paths = [
+                    os.path.join(dataset_prefix, x)
+                    for x in all_subfolders
+                    if os.path.isdir(os.path.join(dataset_prefix, x))
+                ]
         else:
             raise ValueError('num_train_objects not supported')
         

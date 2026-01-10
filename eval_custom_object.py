@@ -150,6 +150,8 @@ def fix_config_paths(config: list, asset_dir: str) -> list:
     generated on a different machine. This function rewrites those paths to
     point to the correct local asset directory.
     
+    Supports both v1 (URDF at root) and v2 (URDF in urdf/) layouts.
+    
     Args:
         config: Parsed YAML config (list of dicts)
         asset_dir: Path to the current asset directory
@@ -157,6 +159,8 @@ def fix_config_paths(config: list, asset_dir: str) -> list:
     Returns:
         Config with fixed paths
     """
+    from manipulation.custom_object_utils.object_utils import find_first_urdf
+    
     fixed_config = []
     asset_dir = os.path.abspath(asset_dir)
     
@@ -176,10 +180,20 @@ def fix_config_paths(config: list, asset_dir: str) -> list:
                         basename = os.path.basename(old_path)
                         
                         if key == 'urdf_path':
-                            # Try to find the URDF in asset_dir
-                            new_path = os.path.join(asset_dir, basename)
-                            if os.path.exists(new_path):
+                            # Try to find the URDF using the v1/v2-aware finder
+                            try:
+                                new_path = str(find_first_urdf(asset_dir))
                                 fixed_entry[key] = new_path
+                            except FileNotFoundError:
+                                # Fall back to original path handling
+                                new_path = os.path.join(asset_dir, basename)
+                                if os.path.exists(new_path):
+                                    fixed_entry[key] = new_path
+                                else:
+                                    # Try urdf/ subfolder (v2)
+                                    new_path = os.path.join(asset_dir, 'urdf', basename)
+                                    if os.path.exists(new_path):
+                                        fixed_entry[key] = new_path
                         elif key in ['solution_path', 'reward_asset_path']:
                             # These should point to asset_dir
                             fixed_entry[key] = asset_dir

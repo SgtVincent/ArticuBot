@@ -25,22 +25,48 @@ from manipulation.utils.handle_utiils import (
     load_obj,
     rotate_point_around_axis,
 )
+from manipulation.custom_object_utils.object_utils import detect_asset_version
 
 PROJECT_DIR = Path(os.environ.get("PROJECT_DIR", Path.cwd()))
 
 
 def _derive_asset_root(urdf_path: str, asset_dir_hint: Optional[str]) -> Path:
-    """Return the directory that stores mobility/json metadata for an object."""
+    """Return the directory that stores mobility/json metadata for an object.
+    
+    For v2 format where URDF is in urdf/ subfolder, we return the parent of urdf/.
+    For v1 format where URDF is at root, we return the URDF's parent.
+    """
     if asset_dir_hint:
         hint_path = Path(asset_dir_hint)
         if hint_path.exists():
+            # Validate: if mobility_v2.json exists here, use it
+            if (hint_path / "mobility_v2.json").exists():
+                return hint_path
+            # Check if this is a v2 layout hint pointing to urdf/ subfolder
+            if hint_path.name == "urdf" and (hint_path.parent / "mobility_v2.json").exists():
+                return hint_path.parent
             return hint_path
-    urdf_parent = Path(urdf_path).parent
+    
+    urdf_parent = Path(urdf_path).parent.resolve()
+    
+    # Check if URDF is in a urdf/ subdirectory (v2 format)
+    if urdf_parent.name == "urdf":
+        asset_root_candidate = urdf_parent.parent
+        if (asset_root_candidate / "mobility_v2.json").exists():
+            return asset_root_candidate
+    
+    # Original v1 logic
     dataset_idx = str(urdf_parent).find("data/dataset")
     if dataset_idx != -1:
         rel = str(urdf_parent)[dataset_idx:]
         return (PROJECT_DIR / rel).resolve()
-    return urdf_parent.resolve()
+    
+    # Check if mobility_v2.json is in parent (another v2 check)
+    if not (urdf_parent / "mobility_v2.json").exists():
+        if (urdf_parent.parent / "mobility_v2.json").exists():
+            return urdf_parent.parent
+    
+    return urdf_parent
 
 
 def _load_mobility_info(asset_root: Path) -> List[dict]:

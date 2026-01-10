@@ -22,31 +22,6 @@ Dataset Structure:
     │       ├── mobility.urdf
     │       └── mobility_v2.json
     └── ...
-
-Usage examples:
-    # Evaluate a finetuned policy on original model
-    python eval_sim_to_sim.py 
-        --sim-dataset-dir data/custom_objects_v2/sim 
-        --object-type microwave 
-        --object-id 7128 
-        --high-level-ckpt weighted_displacement_model/exps/microwave_7128_finetuned/best.pth 
-        --num-trials 25
-
-    # Evaluate multiple objects
-    python eval_sim_to_sim.py 
-        --sim-dataset-dir data/custom_objects_v2/sim 
-        --object-list microwave_7128 microwave_7167 oven_7130 
-        --high-level-ckpt path/to/checkpoint.pth 
-        --num-trials 10
-
-    # Evaluate on digital twin model (for comparison)
-    python eval_sim_to_sim.py 
-        --sim-dataset-dir data/custom_objects_v2/sim 
-        --object-type microwave 
-        --object-id 7128 
-        --eval-on-twin 
-        --high-level-ckpt path/to/checkpoint.pth 
-        --num-trials 10
 """
 
 import os
@@ -84,21 +59,7 @@ from manipulation.utils import build_up_env_eval, build_up_env_gen, save_numpy_a
 # =============================================================================
 
 def parse_object_folder_name(folder_name: str) -> Tuple[str, str]:
-    """Parse object folder name into object type and ID.
-    
-    Args:
-        folder_name: Folder name like 'microwave_7128' or 'storagefurniture1_44781'
-        
-    Returns:
-        Tuple of (object_type, object_id)
-        
-    Example:
-        >>> parse_object_folder_name('microwave_7128')
-        ('microwave', '7128')
-        >>> parse_object_folder_name('storagefurniture1_44781')
-        ('storagefurniture1', '44781')
-    """
-    # Find the last underscore followed by digits
+    """Parse object folder name into object type and ID."""
     parts = folder_name.rsplit('_', 1)
     if len(parts) == 2 and parts[1].isdigit():
         return parts[0], parts[1]
@@ -107,65 +68,33 @@ def parse_object_folder_name(folder_name: str) -> Tuple[str, str]:
 
 
 def get_digital_twin_path(sim_dataset_dir: str, object_type: str, object_id: str) -> str:
-    """Get path to digital twin model.
-    
-    Args:
-        sim_dataset_dir: Root directory of sim dataset (e.g., data/custom_objects_v2/sim)
-        object_type: Object type (e.g., 'microwave')
-        object_id: Object ID (e.g., '7128')
-        
-    Returns:
-        Path to digital twin folder
-    """
+    """Get path to digital twin model."""
     folder_name = f"{object_type}_{object_id}"
     return os.path.join(sim_dataset_dir, folder_name)
 
 
 def get_original_model_path(sim_dataset_dir: str, object_id: str) -> str:
-    """Get path to original PartNet-Mobility model.
-    
-    Args:
-        sim_dataset_dir: Root directory of sim dataset
-        object_id: Object ID (e.g., '7128')
-        
-    Returns:
-        Path to original model folder in assets/
-    """
+    """Get path to original PartNet-Mobility model."""
     return os.path.join(sim_dataset_dir, 'assets', object_id)
 
 
 def find_all_paired_objects(sim_dataset_dir: str) -> List[Dict]:
-    """Find all object pairs (digital twin + original model) in the dataset.
-    
-    Args:
-        sim_dataset_dir: Root directory of sim dataset
-        
-    Returns:
-        List of dicts with keys: object_type, object_id, twin_path, original_path
-    """
+    """Find all object pairs (digital twin + original model) in the dataset."""
     paired_objects = []
-    
-    # List all folders in sim_dataset_dir
     for entry in os.listdir(sim_dataset_dir):
         entry_path = os.path.join(sim_dataset_dir, entry)
-        
-        # Skip non-directories and special folders
         if not os.path.isdir(entry_path):
             continue
         if entry in ['assets', '__pycache__']:
             continue
-            
-        # Try to parse as object folder
         try:
             object_type, object_id = parse_object_folder_name(entry)
         except ValueError:
             continue
-            
-        # Check if both twin and original exist
+        
         twin_path = entry_path
         original_path = get_original_model_path(sim_dataset_dir, object_id)
         
-        # Verify paths exist and have required files
         twin_urdf_dir = os.path.join(twin_path, 'urdf')
         original_urdf = os.path.join(original_path, 'mobility.urdf')
         
@@ -177,8 +106,49 @@ def find_all_paired_objects(sim_dataset_dir: str) -> List[Dict]:
                 'original_path': original_path,
                 'folder_name': entry,
             })
-    
     return sorted(paired_objects, key=lambda x: (x['object_type'], x['object_id']))
+
+
+def load_twin_config_stats(twin_path: str) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+    """Load size, center, and euler from twin's base_config.yaml.
+    
+    Args:
+        twin_path: Path to digital twin folder
+        
+    Returns:
+        Tuple of (size, center_str, euler_str) or (None, None, None) if not found
+    """
+    config_path = os.path.join(twin_path, "base_config.yaml")
+    if not os.path.exists(config_path):
+        return None, None, None
+
+    try:
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+        
+        for entry in config:
+            if isinstance(entry, dict) and entry.get("type") == "urdf":
+                size = entry.get("size")
+                center = entry.get("center")
+                euler = entry.get("euler")
+                
+                # Handle center format
+                if isinstance(center, (list, tuple)):
+                    center_str = f"({center[0]}, {center[1]}, {center[2]})"
+                else:
+                    center_str = str(center)
+                
+                # Handle euler format
+                if isinstance(euler, (list, tuple)):
+                    euler_str = f"({euler[0]}, {euler[1]}, {euler[2]})"
+                else:
+                    euler_str = str(euler)
+                
+                return size, center_str, euler_str
+    except Exception as e:
+        print(f"Warning: Failed to load twin config: {e}")
+    
+    return None, None, None
 
 
 def create_original_model_config(
@@ -186,26 +156,11 @@ def create_original_model_config(
     object_type: str,
     output_dir: str,
     target_position: Tuple[float, float, float] = (0.4, 0.0, 0.0),
-    scale: float = 1.0,
+    target_size: float = 0.7,
+    target_euler: str = "(0.0, 0.0, 0.0)",
     init_joint_angle: float = 0.0,
 ) -> str:
-    """Create a task config YAML for evaluating on original model.
-    
-    The original PartNet-Mobility models have different structure than digital twins,
-    so we need to generate appropriate config files for them.
-    
-    Args:
-        original_path: Path to original model folder
-        object_type: Type of object (microwave, oven, etc.)
-        output_dir: Directory to write config file
-        target_position: Where to place the object
-        scale: Scale factor for the object
-        init_joint_angle: Initial joint angle
-        
-    Returns:
-        Path to generated config file
-    """
-    # Read mobility_v2.json for joint information
+    """Create a task config YAML for evaluating on original model."""
     mobility_path = os.path.join(original_path, 'mobility_v2.json')
     if not os.path.exists(mobility_path):
         raise FileNotFoundError(f"mobility_v2.json not found: {mobility_path}")
@@ -213,13 +168,11 @@ def create_original_model_config(
     with open(mobility_path, 'r') as f:
         mobility_info = json.load(f)
     
-    # Find the main articulated joint (first non-free joint with parent != -1)
     main_joint = None
     handle_link = None
     for joint_info in mobility_info:
         if joint_info.get('parent', -1) >= 0 and joint_info.get('joint') in ['hinge', 'slider']:
             main_joint = joint_info
-            # Get the link name from parts
             parts = joint_info.get('parts', [])
             if parts:
                 handle_link = f"link_{joint_info.get('id', 0)}"
@@ -228,26 +181,21 @@ def create_original_model_config(
     if main_joint is None:
         raise ValueError(f"No articulated joint found in {mobility_path}")
     
-    # Get joint limits
     joint_data = main_joint.get('jointData', {})
     limit_data = joint_data.get('limit', {})
     lower_limit = limit_data.get('a', 0)
     upper_limit = limit_data.get('b', 1.57)
     
-    # For hinge joints, convert degrees to radians if needed
     if main_joint.get('joint') == 'hinge':
-        if abs(upper_limit) > 3.2:  # Likely in degrees
+        if abs(upper_limit) > 3.2:
             lower_limit = np.deg2rad(lower_limit)
             upper_limit = np.deg2rad(upper_limit)
     
-    # Ensure limits are in correct order
     if lower_limit > upper_limit:
         lower_limit, upper_limit = upper_limit, lower_limit
     
-    # Construct the URDF path
     urdf_path = os.path.join(original_path, 'mobility.urdf')
     
-    # Determine object class name for environment
     object_class_map = {
         'microwave': 'Microwave',
         'oven': 'Oven',
@@ -263,18 +211,8 @@ def create_original_model_config(
     }
     object_class = object_class_map.get(object_type.lower(), 'StorageFurniture')
     
-    # NOTE: The simulator's config parser (`parse_config` in
-    # manipulation/utils/env_utils.py) expects each URDF object entry to contain
-    # at least: `name`, `type`, `urdf_path`, `size`, and `center`.
-    # `size` is treated as the target diagonal length (meters) and is used to
-    # scale the URDF via PyBullet's `globalScaling`.
     center_str = f"({target_position[0]}, {target_position[1]}, {target_position[2]})"
-    euler_str = "(0.0, 0.0, 0.0)"
-
-    # Heuristic default size similar to existing custom-object configs.
-    # `scale` acts as a multiplier on this target diagonal length.
-    target_size = float(scale) * 0.7
-
+    
     config = [
         {'use_table': False},
         {
@@ -284,7 +222,7 @@ def create_original_model_config(
             'reward_asset_path': original_path,
             'link_name': handle_link or 'link_0',
             'center': center_str,
-            'euler': euler_str,
+            'euler': target_euler,
             'orientation': [0.0, 0.0, 0.0, 1.0],
             'size': target_size,
             'on_table': False,
@@ -295,7 +233,6 @@ def create_original_model_config(
         },
     ]
     
-    # Write config file
     os.makedirs(output_dir, exist_ok=True)
     config_path = os.path.join(output_dir, 'eval_config.yaml')
     with open(config_path, 'w') as f:
@@ -310,22 +247,11 @@ def create_original_model_config(
 
 def load_policies(low_level_exp_dir: str, low_level_ckpt_name: str,
                   high_level_ckpt_path: str, add_one_hot_encoding: bool = False):
-    """Load pretrained or finetuned high-level and low-level policies.
-    
-    Args:
-        low_level_exp_dir: Path to low-level policy experiment directory
-        low_level_ckpt_name: Checkpoint filename within checkpoints/
-        high_level_ckpt_path: Path to high-level policy checkpoint (.pth)
-        add_one_hot_encoding: Whether to use one-hot encoding for modality
-        
-    Returns:
-        Tuple of (cfg, low_level_policy, high_level_policy)
-    """
+    """Load pretrained or finetuned high-level and low-level policies."""
     print("=" * 60)
     print("Loading Policies...")
     print("=" * 60)
     
-    # Load low-level policy
     print(f"  Low-level: {low_level_exp_dir}/{low_level_ckpt_name}")
     with hydra.initialize(config_path='3d_diffusion_policy/3D-Diffusion-Policy/3D-Diffusion-Policy/diffusion_policy_3d/config'):
         recomposed_config = hydra.compose(
@@ -347,7 +273,6 @@ def load_policies(low_level_exp_dir: str, low_level_ckpt_name: str,
     low_level_policy = low_level_policy.to('cuda')
     cprint("  ✓ Low-level policy loaded", "green")
     
-    # Load high-level policy
     print(f"  High-level: {high_level_ckpt_path}")
     num_class = 13
     input_channel = 5 if add_one_hot_encoding else 3
@@ -376,22 +301,12 @@ def construct_env_for_original_model(
     randomize_object_pose: bool = True,
     randomize_robot_joints: bool = True,
     randomize_joint_angle: bool = True,
+    max_attempts: int = 100,
+    target_size: float = 0.7,
+    target_center: Tuple[float, float, float] = (0.4, 0.0, 0.0),
+    target_euler: str = "(0.0, 0.0, 0.0)",
 ):
-    """Construct environment for evaluating on original PartNet-Mobility model.
-    
-    Args:
-        cfg: Hydrated config with n_obs_steps, n_action_steps
-        original_path: Path to original model folder
-        object_type: Type of object
-        temp_dir: Directory for temporary config files
-        num_points: Number of points in point cloud
-        observation_mode: Observation mode for wrapper
-        render: Enable GUI rendering
-        randomize_*: Randomization flags
-        
-    Returns:
-        Tuple of (env, object_name, init_angle, joint_limits)
-    """
+    """Construct environment for evaluating on original PartNet-Mobility model."""
     from manipulation.utils import build_up_env_random
     
     # Create config for original model
@@ -399,9 +314,11 @@ def construct_env_for_original_model(
         original_path=original_path,
         object_type=object_type,
         output_dir=temp_dir,
+        target_size=target_size,
+        target_position=target_center,
+        target_euler=target_euler,
     )
     
-    # Read back the config to get object info
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
@@ -414,11 +331,6 @@ def construct_env_for_original_model(
             if 'link_name' in entry:
                 link_name = entry['link_name']
     
-    # Build environment with random initialization
-    # IMPORTANT: Use the custom-object environment for this project.
-    # We treat the original PartNet asset as a "custom object" during eval.
-    # Also disable joint-angle randomization here to avoid relying on legacy
-    # handle/parts_render pipelines during initialization.
     env, save_config = build_up_env_random(
         task_config=config_path,
         env_name='articulated_custom_object',
@@ -427,16 +339,11 @@ def construct_env_for_original_model(
         randomize_robot_joints=randomize_robot_joints,
         randomize_initial_joint_angle=False,
         horizon=600,
-        max_attempts=100,
+        max_attempts=max_attempts,
         far_distance=0.6,
         near_distance=0.25,
     )
     
-    # Wrap with point cloud wrapper
-    # NOTE: RobogenPointCloudWrapper tries to load goal states from
-    # stage_lengths.json (saved demo trajectory). In sim-to-sim evaluation we
-    # use random initialization (no saved states), so use the custom wrapper
-    # with skip_goal_loading=True to avoid requiring those files.
     pointcloud_env = RobogenPointCloudWrapperCustom(
         env,
         object_name,
@@ -447,7 +354,6 @@ def construct_env_for_original_model(
         skip_env_info=True,
     )
     
-    # Wrap with multi-step wrapper
     wrapped_env = MultiStepWrapper(
         pointcloud_env,
         n_obs_steps=cfg.n_obs_steps,
@@ -456,7 +362,6 @@ def construct_env_for_original_model(
         reward_agg_method='sum'
     )
     
-    # Get initial joint angle and limits
     object_id = env.urdf_ids[object_name]
     init_angle = None
     joint_limits = None
@@ -467,7 +372,7 @@ def construct_env_for_original_model(
         if joint_info[2] in [p.JOINT_REVOLUTE, p.JOINT_PRISMATIC]:
             joint_state = p.getJointState(object_id, i, physicsClientId=env.id)
             init_angle = joint_state[0]
-            joint_limits = (joint_info[8], joint_info[9])  # lower, upper
+            joint_limits = (joint_info[8], joint_info[9])
             break
     
     return wrapped_env, object_name, init_angle, joint_limits
@@ -481,26 +386,14 @@ def construct_env_for_digital_twin(
     num_points: int = 4500,
     observation_mode: str = "act3d_goal_displacement_gripper_to_object",
     render: bool = False,
+    max_attempts: int = 100,
+    target_size: float = 0.7,
+    target_center: str = '(0.4, 0.0, 0.0)',
+    target_euler: str = '(0.0, 0.0, 0.0)',
 ):
-    """Construct environment for evaluating on digital twin model.
-    
-    Uses the custom wrapper since digital twins have different naming conventions.
-    
-    Args:
-        cfg: Hydrated config
-        twin_path: Path to digital twin folder
-        object_type: Type of object
-        temp_dir: Directory for temporary config files
-        num_points: Number of points in point cloud
-        observation_mode: Observation mode
-        render: Enable GUI rendering
-        
-    Returns:
-        Tuple of (env, object_name, init_angle, joint_limits)
-    """
+    """Construct environment for evaluating on digital twin model."""
     from manipulation.utils import build_up_env_random
     
-    # Find URDF file in twin
     urdf_dir = os.path.join(twin_path, 'urdf')
     urdf_files = [f for f in os.listdir(urdf_dir) if f.endswith('.urdf')]
     if not urdf_files:
@@ -508,7 +401,6 @@ def construct_env_for_digital_twin(
     
     urdf_path = os.path.join(urdf_dir, urdf_files[0])
     
-    # Build minimal config
     object_class = object_type.capitalize()
     if 'storagefurniture' in object_type.lower():
         object_class = 'StorageFurniture'
@@ -520,10 +412,10 @@ def construct_env_for_digital_twin(
             'urdf_path': urdf_path,
             'solution_path': twin_path,
             'reward_asset_path': twin_path,
-            'link_name': 'link1',  # Digital twins typically use link0, link1
-            'center': '(0.4, 0.0, 0.0)',
-            'size': 0.7,
-            'euler': '(0.0, 0.0, 0.0)',
+            'link_name': 'link1',
+            'center': target_center,
+            'size': target_size,
+            'euler': target_euler,
             'orientation': [0.0, 0.0, 0.0, 1.0],
             'init_angle': 0.0,
         },
@@ -533,7 +425,6 @@ def construct_env_for_digital_twin(
     with open(config_path, 'w') as f:
         yaml.dump(config, f)
     
-    # Build environment
     env, _ = build_up_env_random(
         task_config=config_path,
         env_name='articulated_custom_object',
@@ -542,12 +433,11 @@ def construct_env_for_digital_twin(
         randomize_robot_joints=True,
         randomize_initial_joint_angle=True,
         horizon=600,
-        max_attempts=100,
+        max_attempts=max_attempts,
     )
     
     object_name = object_class.lower()
     
-    # Wrap with custom wrapper for digital twins
     pointcloud_env = RobogenPointCloudWrapperCustom(
         env,
         object_name,
@@ -566,7 +456,6 @@ def construct_env_for_digital_twin(
         reward_agg_method='sum'
     )
     
-    # Get initial joint state
     object_id = env.urdf_ids[object_name]
     init_angle = None
     joint_limits = None
@@ -629,32 +518,18 @@ def high_level_policy_infer(obs_dict, high_level_policy,
     return outputs
 
 
-def compute_normalized_opening(init_angle: float, final_angle: float,
-                               joint_limits: Tuple[float, float]) -> float:
-    """Compute normalized opening ratio.
-    
-    Args:
-        init_angle: Initial joint angle
-        final_angle: Final joint angle
-        joint_limits: (lower_limit, upper_limit)
-        
-    Returns:
-        Normalized opening ratio [0, 1], where 1 means fully opened
-    """
+def compute_normalized_opening(angle: float, joint_limits: Tuple[float, float]) -> float:
+    """Compute normalized opening ratio for a joint angle."""
     lower, upper = joint_limits
-    range_size = abs(upper - lower)
-    
-    if range_size < 1e-6:
+    if lower > upper:
+        lower, upper = upper, lower
+
+    denom = upper - lower
+    if abs(denom) < 1e-6:
         return 0.0
-    
-    # Opening is measured relative to the closed state (lower limit)
-    init_ratio = abs(init_angle - lower) / range_size
-    final_ratio = abs(final_angle - lower) / range_size
-    
-    # Improvement in opening
-    improvement = final_ratio - init_ratio
-    
-    return improvement
+
+    ratio = (angle - lower) / denom
+    return float(np.clip(ratio, 0.0, 1.0))
 
 
 def run_single_trial(
@@ -669,14 +544,9 @@ def run_single_trial(
     output_obj_pcd_only: bool = True,
     add_one_hot_encoding: bool = False,
     save_gif: bool = True,
+    step_timeout_s: Optional[float] = None,
 ):
-    """Run a single evaluation trial.
-    
-    Returns:
-        Tuple of (rgb_frames, metrics_dict)
-    """
-    from manipulation.utils import rotation_transfer_matrix_to_6D
-    
+    """Run a single evaluation trial."""
     obs = env.reset()
     all_rgbs = []
     
@@ -687,7 +557,11 @@ def run_single_trial(
     last_goal = None
     steps_taken = 1
     
+    import time
+    import scipy.spatial.distance
+
     for t in range(1, horizon):
+        step_start = time.time()
         # Prepare input
         parallel_input_dict = dict_apply(obs, lambda x: torch.from_numpy(x).to('cuda'))
         for key in obs:
@@ -720,7 +594,6 @@ def run_single_trial(
         point_cloud_all = parallel_input_dict['point_cloud']
         
         displacements_list = []
-        import scipy.spatial.distance
         for b in range(B):
             step_disps = []
             for s in range(T_hist):
@@ -739,6 +612,9 @@ def run_single_trial(
         action = action_dict['action'][0].detach().cpu().numpy()
         
         obs, reward, done, info = env.step(action)
+
+        if step_timeout_s is not None and (time.time() - step_start) > step_timeout_s:
+            raise TimeoutError(f"Step timeout exceeded: {time.time() - step_start:.2f}s > {step_timeout_s:.2f}s")
         env.env.goal_gripper_pcd = np_goal.squeeze(0)[0]
         
         if save_gif:
@@ -766,13 +642,23 @@ def run_single_trial(
     
     # Compute metrics
     improved_angle = final_angle - init_angle if (init_angle is not None and final_angle is not None) else 0.0
-    normalized_opening = compute_normalized_opening(init_angle, final_angle, joint_limits) if joint_limits else 0.0
+
+    if joint_limits and (init_angle is not None) and (final_angle is not None):
+        init_opening = compute_normalized_opening(init_angle, joint_limits)
+        final_opening = compute_normalized_opening(final_angle, joint_limits)
+        opening_improvement = final_opening - init_opening
+    else:
+        init_opening = 0.0
+        final_opening = 0.0
+        opening_improvement = 0.0
     
     metrics = {
         'initial_angle': float(init_angle) if init_angle is not None else 0.0,
         'final_angle': float(final_angle) if final_angle is not None else 0.0,
         'improved_angle': float(improved_angle),
-        'normalized_opening': float(normalized_opening),
+        'normalized_opening': float(final_opening),
+        'normalized_opening_init': float(init_opening),
+        'normalized_opening_improvement': float(opening_improvement),
         'steps_taken': steps_taken,
     }
     
@@ -795,25 +681,12 @@ def evaluate_object(
     render: bool = False,
     save_gifs: bool = True,
     add_one_hot_encoding: bool = False,
+    ik_max_iterations: Optional[int] = None,
+    ik_residual_threshold: Optional[float] = None,
+    step_timeout_s: Optional[float] = None,
+    env_max_attempts: int = 100,
 ):
-    """Evaluate policy on a single object.
-    
-    Args:
-        cfg: Hydrated config
-        low_level_policy: Low-level policy
-        high_level_policy: High-level policy
-        object_info: Dict with object_type, object_id, twin_path, original_path
-        eval_on_twin: If True, evaluate on digital twin instead of original
-        num_trials: Number of evaluation trials
-        save_dir: Directory to save results
-        horizon: Episode horizon
-        render: Enable GUI
-        save_gifs: Save GIF for each trial
-        add_one_hot_encoding: Use one-hot encoding
-        
-    Returns:
-        Dict with aggregated metrics
-    """
+    """Evaluate policy on a single object."""
     object_type = object_info['object_type']
     object_id = object_info['object_id']
     folder_name = object_info['folder_name']
@@ -823,7 +696,27 @@ def evaluate_object(
     print(f"Evaluating: {folder_name} on {eval_target}")
     print(f"{'='*60}")
     
-    # Create output directory
+    # Load config stats from twin
+    twin_size, twin_center_str, twin_euler_str = load_twin_config_stats(object_info['twin_path'])
+    
+    # Fallback defaults when twin config stats are missing
+    if twin_size is None:
+        twin_size = 0.7
+    if twin_center_str is None:
+        twin_center_str = '(0.4, 0.0, 0.0)'
+    
+    # Parse center string to tuple for original model
+    try:
+        if twin_center_str.startswith('(') and twin_center_str.endswith(')'):
+            center_tuple = tuple(map(float, twin_center_str.strip('()').split(',')))
+        else:
+            # Try simple split if no parens
+            center_tuple = tuple(map(float, twin_center_str.split(',')))
+    except (ValueError, TypeError):
+        center_tuple = (0.4, 0.0, 0.0)
+    
+    cprint(f"Using inherited config: Size={twin_size}, Center={twin_center_str}, Euler={twin_euler_str}", "cyan")
+    
     object_save_dir = os.path.join(save_dir, folder_name, eval_target)
     os.makedirs(object_save_dir, exist_ok=True)
     
@@ -842,6 +735,10 @@ def evaluate_object(
                     object_type=object_type,
                     temp_dir=temp_dir,
                     render=render,
+                    max_attempts=env_max_attempts,
+                    target_size=twin_size,
+                    target_center=twin_center_str,
+                    target_euler=twin_euler_str if twin_euler_str else '(0.0, 0.0, 0.0)',
                 )
             else:
                 env, object_name, init_angle, joint_limits = construct_env_for_original_model(
@@ -850,8 +747,19 @@ def evaluate_object(
                     object_type=object_type,
                     temp_dir=temp_dir,
                     render=render,
+                    max_attempts=env_max_attempts,
+                    target_size=twin_size,
+                    target_center=center_tuple,
+                    target_euler=twin_euler_str if twin_euler_str else "(0.0, 0.0, 0.0)",
                 )
             
+            # Configure IK limits for evaluation robustness
+            base_env = env.env._env if hasattr(env.env, '_env') else env.env
+            if ik_max_iterations is not None:
+                setattr(base_env, 'ik_max_iterations', int(ik_max_iterations))
+            if ik_residual_threshold is not None:
+                setattr(base_env, 'ik_residual_threshold', float(ik_residual_threshold))
+
             # Run trial
             all_rgbs, metrics = run_single_trial(
                 env,
@@ -863,6 +771,7 @@ def evaluate_object(
                 horizon=horizon,
                 add_one_hot_encoding=add_one_hot_encoding,
                 save_gif=save_gifs,
+                step_timeout_s=step_timeout_s,
             )
             
             metrics['trial'] = trial_idx
@@ -960,10 +869,24 @@ def parse_args():
                         help='Path to high-level checkpoint (.pth)')
     
     # Evaluation settings
-    parser.add_argument('--num-trials', type=int, default=10,
-                        help='Number of evaluation trials per object')
+    parser.add_argument('--num-trials', type=int, default=5,
+                        help='Number of evaluation trials per object (dev default: 5; use 25 for reporting)')
     parser.add_argument('--horizon', type=int, default=70,
                         help='Steps per episode')
+
+    parser.add_argument('--quick', action='store_true',
+                        help='Quick dev mode: caps trials/init attempts/IK iterations and disables GIFs')
+
+    parser.add_argument('--env-max-attempts', type=int, default=100,
+                        help='Max attempts for random init collision-free search (default: 100)')
+
+    # IK / runtime controls
+    parser.add_argument('--ik-max-iterations', type=int, default=10000,
+                        help='Max iterations for Bullet IK solver (default: 10000)')
+    parser.add_argument('--ik-residual-threshold', type=float, default=1e-4,
+                        help='Residual threshold for Bullet IK solver (default: 1e-4)')
+    parser.add_argument('--step-timeout-s', type=float, default=None,
+                        help='Optional per-step timeout (seconds). If a single env.step exceeds this, the trial fails.')
     
     # Output settings
     parser.add_argument('--save-dir', type=str, default=None,
@@ -986,6 +909,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.quick:
+        # Keep evaluation responsive during development.
+        args.num_trials = min(int(args.num_trials), 5)
+        args.env_max_attempts = min(int(args.env_max_attempts), 30)
+        args.ik_max_iterations = min(int(args.ik_max_iterations), 500)
+        args.no_gif = True
     
     # List objects mode
     if args.list_objects:
@@ -1070,6 +1000,10 @@ def main():
                 render=args.render,
                 save_gifs=not args.no_gif,
                 add_one_hot_encoding=bool(args.add_one_hot_encoding),
+                ik_max_iterations=args.ik_max_iterations,
+                ik_residual_threshold=args.ik_residual_threshold,
+                step_timeout_s=args.step_timeout_s,
+                env_max_attempts=args.env_max_attempts,
             )
             all_summaries.append(summary)
     

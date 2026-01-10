@@ -474,7 +474,9 @@ class RobogenPointCloudWrapperCustom(RobogenPointCloudWrapper):
                 project_matrices.append(project_matrix)
             self.view_matrices = view_matrices
             self.project_matrices = project_matrices
-            if self.check_handle_observed_in_pc(handle_pc=handle_pc) > 5:
+            # Use lower threshold for custom objects with sparse handle annotations
+            # (annotation points may only have 4 points)
+            if self.check_handle_observed_in_pc(handle_pc=handle_pc) >= 1:
                 self._env.projection_matrix = project_matrices[0]
                 self._env.view_matrix = view_matrices[0]
                 break
