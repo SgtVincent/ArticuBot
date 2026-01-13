@@ -26,9 +26,24 @@ import tempfile
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 import numpy as np
 import yaml
+
+
+def _default_host_graspgen_root() -> str:
+    """Default host root expected to be mounted to ``/workspace/data``.
+
+    See scripts/run_graspgen_container.sh.
+    """
+    project_dir = os.environ.get("PROJECT_DIR")
+    if project_dir:
+        candidate = Path(project_dir).expanduser().resolve() / "data"
+        return str(candidate)
+
+    # Fallback: keep a reasonable default relative to this file.
+    repo_root = Path(__file__).resolve().parents[2]
+    return str((repo_root / "data").resolve())
 
 
 @dataclass
@@ -51,8 +66,8 @@ class GraspGenConfig:
     
     # Path mapping: host path -> container path
     # The GraspGen container mounts certain directories
-    host_graspgen_root: str = "/home/junting/repo/articulated_objects/GraspGen/GraspGenModels"
-    container_graspgen_root: str = "/code/GraspGenModels"
+    host_graspgen_root: str = field(default_factory=_default_host_graspgen_root)
+    container_graspgen_root: str = "/workspace/data"
     
     # Timeout for Docker command
     timeout_seconds: float = 120.0
@@ -251,7 +266,7 @@ def predict_grasps_for_urdf_folder(
 def prepare_urdf_with_joint_state(
     original_urdf_path: str,
     joint_states: dict,
-    output_folder: str,
+    output_folder: Union[str, Path],
     scale: float = 1.0,
 ) -> str:
     """Prepare a URDF with specific joint states for grasp prediction.
@@ -278,22 +293,22 @@ def prepare_urdf_with_joint_state(
         Path to the prepared URDF folder.
     """
     original_folder = Path(original_urdf_path).parent
-    output_folder = Path(output_folder)
-    output_folder.mkdir(parents=True, exist_ok=True)
+    output_folder_path = Path(output_folder)
+    output_folder_path.mkdir(parents=True, exist_ok=True)
     
     # Copy all files from original folder
     for item in original_folder.iterdir():
         if item.is_file():
-            shutil.copy2(item, output_folder / item.name)
+            shutil.copy2(item, output_folder_path / item.name)
         elif item.is_dir():
             # Copy subdirectories (meshes, textures, etc.)
-            dest = output_folder / item.name
+            dest = output_folder_path / item.name
             if dest.exists():
                 shutil.rmtree(dest)
             shutil.copytree(item, dest)
     
     # Update base_config.yaml with joint state info
-    base_config_path = output_folder / "base_config.yaml"
+    base_config_path = output_folder_path / "base_config.yaml"
     if base_config_path.exists():
         with open(base_config_path) as f:
             config = yaml.safe_load(f)
@@ -308,11 +323,11 @@ def prepare_urdf_with_joint_state(
         with open(base_config_path, "w") as f:
             yaml.dump(config, f, sort_keys=False)
     
-    return str(output_folder)
+    return str(output_folder_path)
 
 
 def predict_grasps_on_demand(
-    asset_dir: str,
+    asset_dir: Union[str, Path],
     config: Optional[GraspGenConfig] = None,
     force_regenerate: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -331,8 +346,8 @@ def predict_grasps_on_demand(
     if config is None:
         config = GraspGenConfig()
     
-    asset_dir = Path(asset_dir).resolve()
-    predicted_grasps_path = asset_dir / "predicted_grasps.yml"
+    asset_dir_path = Path(asset_dir).resolve()
+    predicted_grasps_path = asset_dir_path / "predicted_grasps.yml"
     
     # Check if we need to regenerate
     if predicted_grasps_path.exists() and not force_regenerate:
@@ -340,6 +355,6 @@ def predict_grasps_on_demand(
         return load_predicted_grasps_yaml(str(predicted_grasps_path))
     
     # Generate new grasps
-    print(f"[GraspGen] Generating new grasps for {asset_dir}")
-    return predict_grasps_for_urdf_folder(str(asset_dir), config)
+    print(f"[GraspGen] Generating new grasps for {asset_dir_path}")
+    return predict_grasps_for_urdf_folder(str(asset_dir_path), config)
 

@@ -37,6 +37,8 @@ from manipulation.custom_object_utils.graspgen_client import (
     prepare_urdf_with_joint_state,
 )
 
+from manipulation.custom_object_utils.demo_utils import get_graspgen_host_root_for_asset
+
 
 def _custom_gen_init_state_integrated(
     q,
@@ -229,10 +231,10 @@ def _custom_gen_init_state_integrated(
         
         try:
             prepared = prepare_urdf_with_joint_state(urdf_path, joint_states, tmp_dir, scale=object_scale)
-            host_root = str(pathlib.Path(urdf_path).resolve().parent.parent.parent)
+            host_root = get_graspgen_host_root_for_asset(pathlib.Path(urdf_path).resolve().parent)
             gg_cfg = GraspGenConfig(
                 host_graspgen_root=host_root,
-                container_graspgen_root="/code/GraspGenModels",
+                container_graspgen_root="/workspace/data",
             )
             grasps, confidences = predict_grasps_for_urdf_folder(prepared, gg_cfg)
             

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import pathlib
 import time
 import yaml
@@ -47,44 +48,50 @@ def get_graspgen_host_root_for_asset(asset_dir: pathlib.Path) -> str:
     GraspGenModels directory (or a symlink to it). This function returns
     the appropriate host_graspgen_root based on asset layout.
     
-    Expected Docker mount: /code/GraspGenModels -> GraspGen/GraspGenModels
-    With symlink: GraspGenModels/custom_objects_v2 -> ArticuBot/data/custom_objects_v2
+    Expected Docker mount:
+        /workspace -> <host repo root>
+    so an object at:
+        <host repo>/data/custom_objects/... or <host repo>/data/custom_objects_v2/...
+    is visible in-container as:
+        /workspace/data/custom_objects/... or /workspace/data/custom_objects_v2/...
     
     Args:
         asset_dir: Path to the asset directory.
         
     Returns:
-        The host path that maps to /code/GraspGenModels in the container.
+        The host path that maps to /workspace/data in the container.
     """
     asset_dir = pathlib.Path(asset_dir).resolve()
     version = detect_asset_version(asset_dir)
+
+    # Prefer mounting ArticuBot's data/ directory directly into the container.
+    # This avoids requiring GraspGenModels symlinks and keeps paths stable.
+    repo_root = pathlib.Path(os.environ.get("PROJECT_DIR", pathlib.Path(__file__).resolve().parents[2])).resolve()
+    data_root = (repo_root / "data").resolve()
+    try:
+        if asset_dir.is_relative_to(data_root):
+            return str(data_root)
+    except AttributeError:
+        # Python < 3.9 compatibility (shouldn't happen in this repo, but keep safe)
+        asset_dir_str = str(asset_dir)
+        data_root_str = str(data_root)
+        if asset_dir_str == data_root_str or asset_dir_str.startswith(data_root_str + os.sep):
+            return str(data_root)
     
-    # Look for GraspGenModels in the path hierarchy
-    # This handles both direct assets and symlinked assets
+    # Look for GraspGenModels in the path hierarchy (legacy layout).
     for parent in [asset_dir] + list(asset_dir.parents):
         if parent.name == "GraspGenModels":
             # Found GraspGenModels, return its parent + GraspGenModels
             return str(parent)
-        # Also check for custom_objects_v2/sim/<object> pattern
-        if parent.name == "custom_objects_v2":
-            # Return path to GraspGenModels which should contain custom_objects_v2 symlink
-            # Typical structure: GraspGen/GraspGenModels/custom_objects_v2 (symlink)
-            graspgen_root = pathlib.Path("/home/junting/repo/articulated_objects/GraspGen/GraspGenModels")
-            if graspgen_root.exists():
-                return str(graspgen_root)
     
     # Fallback: for v1 assets, asset is typically in custom_objects under GraspGenModels
     # v1: GraspGenModels/custom_objects/sim_microwave_good
     # v2: GraspGenModels/custom_objects_v2/sim/microwave_7167
     if version == 2:
-        # For v2, asset_dir is like: .../custom_objects_v2/sim/microwave_7167
-        # We need to find the root that contains custom_objects_v2
-        # Return the parent of custom_objects_v2 as the graspgen root
+        # For v2 assets, prefer the nearest "data" root if present.
         for parent in asset_dir.parents:
             if parent.name == "data":
-                # This is ArticuBot/data, but GraspGen mounts GraspGenModels
-                # Return the GraspGenModels path that has symlink to this
-                return "/home/junting/repo/articulated_objects/GraspGen/GraspGenModels"
+                return str(parent)
     else:
         # v1: go up 3 levels from URDF parent
         # URDF at asset_dir/*.urdf, parent.parent.parent is GraspGenModels
@@ -463,7 +470,7 @@ def _custom_gen_init_state(
                 host_root = get_graspgen_host_root_for_asset(asset_dir)
                 gg_cfg = GraspGenConfig(
                     host_graspgen_root=host_root,
-                    container_graspgen_root="/code/GraspGenModels",
+                    container_graspgen_root="/workspace/data",
                 )
                 grasps, confidences = predict_grasps_for_urdf_folder(prepared, gg_cfg)
                 if len(confidences) == 0:
