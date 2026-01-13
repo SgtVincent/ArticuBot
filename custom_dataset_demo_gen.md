@@ -58,24 +58,49 @@ ArticuBot uses GraspGen to predict grasp poses. There are two modes:
 
 > ⚠️ **Important**: Pre-generated grasps are computed for a **specific object state** (joint angles, scale). If you use this option, you **must disable** joint randomization and scale randomization in the demo generation step to prevent grasp-pose mismatches.
 
-Start the GraspGen Docker container:
+#### Prepare GraspGen Docker (recommended)
+
+ArticuBot integrates with GraspGen via a long-running Docker container (default name: `friendly_galileo`).
+
+1) Build the image:
 
 ```bash
-cd GraspGen/docker
-./run.sh /path/to/GraspGen --models /path/to/GraspGenModels
+cd third_party/GraspGen
+bash docker/build.sh
 ```
 
-Then inside the container:
+2) Start the container (detached) with the correct mounts:
 
 ```bash
-python scripts/generate_grasps_from_urdf.py \
-    --urdf-root /code/GraspGenModels/custom_objects/sim_microwave_good \
-    --gripper-config GraspGenModels/checkpoints/graspgen_franka_panda.yml \
-    --num-grasps 400 \ 
-    --num-sample-points 2000 \
-    --use-aabb-sampling \
-    --skip-aabb-filter \
-    --no-remove-outliers
+cd /path/to/ArticuBot
+scripts/run_graspgen_container.sh --recreate
+```
+
+Mount convention used by ArticuBot:
+- GraspGen code is available at `/code`
+- The ArticuBot repo is mounted at `/workspace`
+- Your custom objects under `data/` are accessible inside the container as `/workspace/data/...`
+
+If you do not have GPU / NVIDIA runtime available, start with:
+
+```bash
+scripts/run_graspgen_container.sh --recreate --no-gpu
+```
+
+#### Pre-generate grasps
+
+Start the GraspGen Docker container (see steps above), then run grasp generation in the container:
+
+```bash
+docker exec -w /code friendly_galileo \
+    python scripts/generate_grasps_from_urdf.py \
+        --urdf-root /workspace/data/custom_objects/sim_microwave_good \
+        --gripper-config GraspGenModels/checkpoints/graspgen_franka_panda.yml \
+        --num-grasps 400 \
+        --num-sample-points 2000 \
+        --use-aabb-sampling \
+        --skip-aabb-filter \
+        --no-remove-outliers
 ```
 
 This creates `predicted_grasps.yml` in the object folder.
@@ -98,7 +123,14 @@ The demo generator will automatically call GraspGen in Docker for each randomize
 **Requirements:**
 - Docker container `friendly_galileo` (or configured name) must be running
 - GraspGen code mounted at `/code`
-- GraspGenModels mounted at `/code/GraspGenModels`
+- ArticuBot repo mounted at `/workspace` (so assets are accessible at `/workspace/data/...`)
+
+Start the container once (recommended):
+
+```bash
+cd /path/to/ArticuBot
+scripts/run_graspgen_container.sh
+```
 
 The on-demand system:
 1. Randomizes object position and joint angles
