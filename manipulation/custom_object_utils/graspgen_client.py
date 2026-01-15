@@ -24,6 +24,8 @@ import os
 import subprocess
 import tempfile
 import shutil
+import uuid
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -32,17 +34,50 @@ import yaml
 
 
 def _default_host_graspgen_root() -> str:
-    """Default host root expected to be mounted to ``/workspace/data``.
+    """Pick a host directory that is *actually visible* inside the GraspGen container.
 
-    See scripts/run_graspgen_container.sh.
+    In this repo's default setup, the running GraspGen container mounts:
+    - ``<...>/GraspGen/GraspGenModels`` -> ``/models``
+    - ``<...>/GraspGen`` -> ``/code``
+
+    So the safest default is the host ``GraspGenModels`` folder.
     """
+    override = os.environ.get("GRASPGEN_HOST_ROOT")
+    if override:
+        override_path = Path(override).expanduser().resolve()
+        if override_path.exists():
+            return str(override_path)
+
     project_dir = os.environ.get("PROJECT_DIR")
     if project_dir:
-        candidate = Path(project_dir).expanduser().resolve() / "data"
-        return str(candidate)
+        project_dir_path = Path(project_dir).expanduser().resolve()
+
+        # Common layouts:
+        # 1) <...>/ArticuBot (PROJECT_DIR) and <...>/GraspGen/GraspGenModels (sibling)
+        # 2) <...>/ArticuBot (PROJECT_DIR) and <...>/ArticuBot/GraspGen/GraspGenModels (nested)
+        for candidate in [
+            (project_dir_path.parent / "GraspGen" / "GraspGenModels").resolve(),
+            (project_dir_path / "GraspGen" / "GraspGenModels").resolve(),
+        ]:
+            if candidate.exists():
+                return str(candidate)
+
+        sibling_models = (project_dir_path.parent / "GraspGen" / "GraspGenModels").resolve()
+        if sibling_models.exists():
+            return str(sibling_models)
+        # Fallback: some setups mount data directly (not the default in this repo).
+        candidate = (project_dir_path / "data").resolve()
+        if candidate.exists():
+            return str(candidate)
 
     # Fallback: keep a reasonable default relative to this file.
     repo_root = Path(__file__).resolve().parents[2]
+    for candidate in [
+        (repo_root.parent / "GraspGen" / "GraspGenModels").resolve(),
+        (repo_root / "GraspGen" / "GraspGenModels").resolve(),
+    ]:
+        if candidate.exists():
+            return str(candidate)
     return str((repo_root / "data").resolve())
 
 
@@ -65,9 +100,9 @@ class GraspGenConfig:
     aabb_padding: float = 0.2
     
     # Path mapping: host path -> container path
-    # The GraspGen container mounts certain directories
+    # In the default container used by this repo, GraspGenModels is mounted to /models.
     host_graspgen_root: str = field(default_factory=_default_host_graspgen_root)
-    container_graspgen_root: str = "/workspace/data"
+    container_graspgen_root: str = "/models"
     
     # Timeout for Docker command
     timeout_seconds: float = 120.0
@@ -112,9 +147,19 @@ def load_predicted_grasps_yaml(yaml_path: str) -> Tuple[np.ndarray, np.ndarray]:
     
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
+
+    return load_predicted_grasps_yaml_data(data)
+
+
+def load_predicted_grasps_yaml_data(data: Optional[dict]) -> Tuple[np.ndarray, np.ndarray]:
+    """Load grasps from an already-parsed Isaac-format YAML dict."""
+    from scipy.spatial.transform import Rotation as R
+
+    if not data:
+        return np.empty((0, 4, 4)), np.empty((0,))
     
-    grasps = []
-    confidences = []
+    grasps: list[np.ndarray] = []
+    confidences: list[float] = []
     
     for key, value in data.get("grasps", {}).items():
         if value is None:
@@ -143,6 +188,144 @@ def load_predicted_grasps_yaml(yaml_path: str) -> Tuple[np.ndarray, np.ndarray]:
         return np.empty((0, 4, 4)), np.empty((0,))
         
     return np.array(grasps), np.array(confidences)
+
+
+def _docker_exec(config: GraspGenConfig, shell_cmd: str, *, timeout: Optional[float] = None) -> subprocess.CompletedProcess:
+    """Run a shell command inside the GraspGen container."""
+    docker_cmd = [
+        "docker",
+        "exec",
+        "-w",
+        config.container_workdir,
+        config.container_name,
+        "bash",
+        "-lc",
+        shell_cmd,
+    ]
+    return subprocess.run(
+        docker_cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout if timeout is not None else config.timeout_seconds,
+    )
+
+
+def _container_path_exists(config: GraspGenConfig, container_path: str) -> bool:
+    """Check if a path exists inside the container."""
+    result = _docker_exec(config, f"test -d {shlex_quote(container_path)} && echo OK || echo NO", timeout=10.0)
+    return result.returncode == 0 and "OK" in (result.stdout or "")
+
+
+def shlex_quote(s: str) -> str:
+    """Small, local shlex.quote to avoid importing shlex at module import time."""
+    import shlex
+
+    return shlex.quote(s)
+
+
+def _docker_cp_dir_contents_to_container(config: GraspGenConfig, src_dir_host: str, dst_dir_container: str) -> bool:
+    """Copy directory contents from host -> container without relying on bind mounts."""
+    src_dir = str(Path(src_dir_host).resolve())
+    if not Path(src_dir).is_dir():
+        print(f"[GraspGen] docker cp source is not a directory: {src_dir}")
+        return False
+    # Ensure destination exists.
+    mkdir_res = _docker_exec(config, f"mkdir -p {shlex_quote(dst_dir_container)}", timeout=30.0)
+    if mkdir_res.returncode != 0:
+        print(f"[GraspGen] Failed to mkdir in container: {mkdir_res.stderr}")
+        return False
+
+    docker_cp = [
+        "docker",
+        "cp",
+        f"{src_dir}/.",
+        f"{config.container_name}:{dst_dir_container}",
+    ]
+    try:
+        cp_res = subprocess.run(docker_cp, capture_output=True, text=True, timeout=300.0)
+        if cp_res.returncode != 0:
+            print(f"[GraspGen] docker cp failed: {cp_res.stderr or cp_res.stdout}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[GraspGen] docker cp exception: {e}")
+        return False
+
+
+def _docker_cp_file_to_container(config: GraspGenConfig, src_file_host: str, dst_file_container: str) -> bool:
+    """Copy a single file from host -> container."""
+    src_file = str(Path(src_file_host).resolve())
+    if not Path(src_file).is_file():
+        print(f"[GraspGen] docker cp source is not a file: {src_file}")
+        return False
+
+    dst_parent = str(Path(dst_file_container).parent)
+    mkdir_res = _docker_exec(config, f"mkdir -p {shlex_quote(dst_parent)}", timeout=30.0)
+    if mkdir_res.returncode != 0:
+        print(f"[GraspGen] Failed to mkdir in container: {mkdir_res.stderr}")
+        return False
+
+    docker_cp = [
+        "docker",
+        "cp",
+        src_file,
+        f"{config.container_name}:{dst_file_container}",
+    ]
+    try:
+        cp_res = subprocess.run(docker_cp, capture_output=True, text=True, timeout=120.0)
+        if cp_res.returncode != 0:
+            print(f"[GraspGen] docker cp file failed: {cp_res.stderr or cp_res.stdout}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[GraspGen] docker cp file exception: {e}")
+        return False
+
+
+def _container_dir_has_urdf(config: GraspGenConfig, container_dir: str) -> bool:
+    """Best-effort check whether a container directory contains at least one .urdf file."""
+    res = _docker_exec(
+        config,
+        f"test -d {shlex_quote(container_dir)} && find {shlex_quote(container_dir)} -maxdepth 2 -name '*.urdf' -print -quit",
+        timeout=10.0,
+    )
+    return res.returncode == 0 and bool((res.stdout or "").strip())
+
+
+def _read_predicted_grasps_yaml_from_container_dir(
+    config: GraspGenConfig, root_dir_container: str
+) -> Optional[dict]:
+    """Read predicted_grasps.yml from a container directory.
+
+    GraspGen sometimes writes the output YAML next to the discovered URDF file,
+    which may be nested under ``root_dir_container``.
+    """
+    # Fast path: root dir.
+    cat_res = _docker_exec(
+        config,
+        f"cat {shlex_quote(root_dir_container + '/predicted_grasps.yml')}",
+        timeout=30.0,
+    )
+    if cat_res.returncode == 0 and (cat_res.stdout or "").strip():
+        return yaml.safe_load(cat_res.stdout)
+
+    # Fallback: search for the first match.
+    find_res = _docker_exec(
+        config,
+        (
+            f"find {shlex_quote(root_dir_container)} -maxdepth 6 -name predicted_grasps.yml -print "
+            "2>/dev/null | head -n 1"
+        ),
+        timeout=30.0,
+    )
+    candidate = (find_res.stdout or "").strip()
+    if not candidate:
+        return None
+
+    cat_res = _docker_exec(config, f"cat {shlex_quote(candidate)}", timeout=30.0)
+    if cat_res.returncode != 0 or not (cat_res.stdout or "").strip():
+        return None
+    return yaml.safe_load(cat_res.stdout)
 
 
 def run_graspgen_in_docker(
@@ -240,27 +423,108 @@ def predict_grasps_for_urdf_folder(
         config = GraspGenConfig()
     
     urdf_folder_host = str(Path(urdf_folder_host).resolve())
-    
-    # Convert to container path
+
+    # Preferred path: host<->container mapping (bind mounts), but only if the
+    # container can actually see the mapped path.
+    urdf_folder_container: Optional[str] = None
     try:
         urdf_folder_container = _host_to_container_path(urdf_folder_host, config)
-    except ValueError as e:
-        print(f"[GraspGen] Path conversion error: {e}")
-        return np.empty((0, 4, 4)), np.empty((0,))
-    
-    # Run GraspGen
-    success, output = run_graspgen_in_docker(urdf_folder_container, config)
-    
+    except ValueError:
+        urdf_folder_container = None
+
+    use_docker_cp_fallback = True
+    if urdf_folder_container is not None:
+        try:
+            use_docker_cp_fallback = not _container_path_exists(config, urdf_folder_container)
+        except Exception:
+            use_docker_cp_fallback = True
+
+    if use_docker_cp_fallback:
+        # Fallback: Use a persistent cache directory in the container.
+        # We only need to update base_config.yaml per attempt (joint state / scale),
+        # so avoid copying large mesh folders on every call.
+        # NOTE: urdf_folder_host is typically a per-attempt temp folder (e.g. _tmp_xxx).
+        # Key off the URDF identity instead so caching actually hits across attempts.
+        urdf_candidates = sorted(Path(urdf_folder_host).glob("*.urdf"))
+        if urdf_candidates:
+            urdf_path = urdf_candidates[0]
+            try:
+                urdf_hash = hashlib.sha1(urdf_path.read_bytes()).hexdigest()[:10]
+            except Exception:
+                urdf_hash = "nohash"
+            key_material = f"{urdf_path.stem}:{urdf_hash}"
+        else:
+            key_material = urdf_folder_host
+
+        cache_key = hashlib.sha1(key_material.encode("utf-8")).hexdigest()[:10]
+        cache_container_dir = f"/tmp/articubot_graspgen_cache_{cache_key}"
+
+        base_config_host = str(Path(urdf_folder_host) / "base_config.yaml")
+        base_config_container = f"{cache_container_dir}/base_config.yaml"
+
+        cache_ready = _container_dir_has_urdf(config, cache_container_dir)
+        if not cache_ready:
+            if urdf_folder_container is None:
+                print(
+                    f"[GraspGen] Using docker-cp cache (populate). "
+                    f"host_graspgen_root={config.host_graspgen_root} urdf_folder_host={urdf_folder_host}"
+                )
+            else:
+                print(
+                    f"[GraspGen] Using docker-cp cache (populate). "
+                    f"urdf_folder_container={urdf_folder_container}"
+                )
+
+            # First time: copy the full folder contents.
+            if not _docker_cp_dir_contents_to_container(config, urdf_folder_host, cache_container_dir):
+                return np.empty((0, 4, 4)), np.empty((0,))
+        else:
+            # Fast path: only refresh base_config.yaml (joint state / scale).
+            if Path(base_config_host).is_file():
+                if not _docker_cp_file_to_container(config, base_config_host, base_config_container):
+                    # If the small file copy fails, fall back to a full refresh.
+                    if not _docker_cp_dir_contents_to_container(config, urdf_folder_host, cache_container_dir):
+                        return np.empty((0, 4, 4)), np.empty((0,))
+            else:
+                # If base_config.yaml is missing, refresh everything.
+                if not _docker_cp_dir_contents_to_container(config, urdf_folder_host, cache_container_dir):
+                    return np.empty((0, 4, 4)), np.empty((0,))
+
+        try:
+            success, _ = run_graspgen_in_docker(cache_container_dir, config)
+            if not success:
+                return np.empty((0, 4, 4)), np.empty((0,))
+
+            data = _read_predicted_grasps_yaml_from_container_dir(config, cache_container_dir)
+            if not data:
+                print(
+                    f"[GraspGen] No predicted_grasps.yml found inside container under {cache_container_dir}"
+                )
+                return np.empty((0, 4, 4)), np.empty((0,))
+
+            return load_predicted_grasps_yaml_data(data)
+        finally:
+            # Keep cache_container_dir for reuse.
+            pass
+
+    # Run GraspGen via mapped path.
+    assert urdf_folder_container is not None
+    success, _ = run_graspgen_in_docker(urdf_folder_container, config)
     if not success:
         return np.empty((0, 4, 4)), np.empty((0,))
-    
-    # Load results
+
     predicted_grasps_path = Path(urdf_folder_host) / "predicted_grasps.yml"
-    if not predicted_grasps_path.exists():
+    if predicted_grasps_path.exists():
+        return load_predicted_grasps_yaml(str(predicted_grasps_path))
+
+    # If the bind mount exists but the host file isn't visible, try reading the
+    # file directly from the container.
+    data = _read_predicted_grasps_yaml_from_container_dir(config, urdf_folder_container)
+    if not data:
         print(f"[GraspGen] No predicted_grasps.yml found at {predicted_grasps_path}")
         return np.empty((0, 4, 4)), np.empty((0,))
-    
-    return load_predicted_grasps_yaml(str(predicted_grasps_path))
+
+    return load_predicted_grasps_yaml_data(data)
 
 
 def prepare_urdf_with_joint_state(
@@ -295,9 +559,27 @@ def prepare_urdf_with_joint_state(
     original_folder = Path(original_urdf_path).parent
     output_folder_path = Path(output_folder)
     output_folder_path.mkdir(parents=True, exist_ok=True)
+
+    original_folder_resolved = original_folder.resolve()
+    output_folder_resolved = output_folder_path.resolve()
     
-    # Copy all files from original folder
+    # Copy all files from original folder.
+    # IMPORTANT: output_folder can live under original_folder (common for v2 assets
+    # where we create temp folders under <asset>/urdf/). Avoid copying the temp
+    # folder into itself, and skip previous temp folders to prevent recursive
+    # nesting that can confuse downstream GraspGen URDF discovery.
     for item in original_folder.iterdir():
+        try:
+            item_resolved = item.resolve()
+        except Exception:
+            item_resolved = (original_folder_resolved / item.name)
+
+        if item_resolved == output_folder_resolved:
+            continue
+
+        if item.is_dir() and item.name.startswith("_tmp_"):
+            continue
+
         if item.is_file():
             shutil.copy2(item, output_folder_path / item.name)
         elif item.is_dir():

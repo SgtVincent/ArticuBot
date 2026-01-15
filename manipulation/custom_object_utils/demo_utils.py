@@ -147,6 +147,7 @@ def create_variant_config(
     urdf_path: Optional[pathlib.Path] = None,
     predicted_grasps: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     target_position: Optional[Tuple[float, float, float]] = None,
+    joint_angle_range: Optional[Tuple[float, float]] = None,
 ) -> pathlib.Path:
     """Create a variant config with randomized parameters.
     
@@ -155,6 +156,8 @@ def create_variant_config(
             Defaults to (0.4, 0.0, 0.0) which is in front of the robot.
             Note: 'center' in config is the URDF's geometric center,
             while target_position is the desired world placement.
+        joint_angle_range: Range for randomizing object joint angle as fraction of limits.
+            Defaults to (0.0, 0.2) which means 0-20% of full range (following gen_demo.py).
     """
     config = yaml.safe_load(open(base_config, "r"))
     new_config = []
@@ -166,6 +169,10 @@ def create_variant_config(
     # Default target position: in front of robot, within arm workspace
     if target_position is None:
         target_position = (0.4, 0.0, 0.0)
+        
+    # Default joint angle range: 0-20% of full range (matches gen_demo.py)
+    if joint_angle_range is None:
+        joint_angle_range = (0.0, 0.2)
     
     for block in config:
         block = dict(block)
@@ -230,6 +237,10 @@ def create_variant_config(
             
             block["predicted_grasp_position"] = serialize_vector(pos.tolist())
             block["predicted_grasp_orientation"] = serialize_vector(quat.tolist())
+        
+        # Add joint angle randomization range for the object's articulated joint
+        # This enables training with objects in various open/closed states
+        block["joint_angle_range"] = serialize_vector(list(joint_angle_range))
             
         new_config.append(block)
         
@@ -268,6 +279,8 @@ def _custom_gen_init_state(
     target_position = None  # Target world placement position
     predicted_grasp_pos = None
     predicted_grasp_orn = None
+    object_scale = 1.0
+    joint_angle_range = (0.0, 0.2)  # Default: 0-20% of joint range (matches gen_demo.py)
     
     for config_dict in config:
         if 'name' in config_dict:
@@ -281,6 +294,15 @@ def _custom_gen_init_state(
         if 'predicted_grasp_position' in config_dict:
             predicted_grasp_pos = parse_center(config_dict['predicted_grasp_position'])
             predicted_grasp_orn = parse_center(config_dict['predicted_grasp_orientation'])
+        if 'size' in config_dict:
+            try:
+                object_scale = float(config_dict['size'])
+            except Exception:
+                pass
+        # Parse joint angle randomization range
+        if 'joint_angle_range' in config_dict:
+            jar = parse_center(config_dict['joint_angle_range'])
+            joint_angle_range = (float(jar[0]), float(jar[1]))
         # capture urdf path if present (for on-demand GraspGen)
         if 'urdf_path' in config_dict and 'urdf_path' not in locals():
             urdf_path_for_graspgen = config_dict['urdf_path']
@@ -324,7 +346,7 @@ def _custom_gen_init_state(
     env.reset()
 
     # get the joint limits for the robot arm, using a smaller range
-    initial_joint_angles = [0 for _ in range(7)]
+    initial_joint_angles: list[float] = [0.0 for _ in range(7)]
     low = [-2.9, -1.8, -2.9, -3.1, -2.9, -0.0, -2.9]
     high = [2.9, 1.8, 2.9, 0.0, 2.9, 3.8, 2.9]
     for i in range(7):
@@ -352,6 +374,8 @@ def _custom_gen_init_state(
     good_init_pos = False
     new_pos = None
     new_orient = None
+    random_object_joint_angle = None  # Will be set if joint randomization succeeds
+    handle_joint_id = getattr(env, 'handle_joint', None)  # Get handle joint ID early
     
     start_time = time.time()
     while not good_init_pos:
@@ -374,6 +398,26 @@ def _custom_gen_init_state(
             base_euler[2] + np.random.uniform(-np.pi / 6, np.pi / 6)
         ])
         p.resetBasePositionAndOrientation(object_id, new_pos, new_orient, physicsClientId=env.id)
+
+        # Randomize object's articulated joint angle (e.g., door/drawer partially open)
+        # This follows the same pattern as gen_demo.py to enable training with varied states
+        if handle_joint_id is not None:
+            joint_info = p.getJointInfo(object_id, handle_joint_id, physicsClientId=env.id)
+            joint_limit_low = joint_info[8]
+            joint_limit_high = joint_info[9]
+            joint_range = joint_limit_high - joint_limit_low
+            # Sample within the specified range fraction
+            fraction = np.random.uniform(joint_angle_range[0], joint_angle_range[1])
+            random_object_joint_angle = joint_limit_low + fraction * joint_range
+            p.resetJointState(object_id, handle_joint_id, random_object_joint_angle, physicsClientId=env.id)
+            # Let physics settle
+            for _ in range(5):
+                p.stepSimulation(physicsClientId=env.id)
+            # Verify joint state was set correctly
+            actual_joint_state = p.getJointState(object_id, handle_joint_id, physicsClientId=env.id)[0]
+            if abs(actual_joint_state - random_object_joint_angle) > 1e-3:
+                # Joint state couldn't be set (collision or constraint), try again
+                continue
 
         # Use RM4D inverse reachability filtering if available
         if traj_filter is not None:
@@ -445,32 +489,19 @@ def _custom_gen_init_state(
                 jstate = p.getJointState(object_id, ji, physicsClientId=env.id)[0]
                 joint_states[jname] = float(jstate)
 
-            # Prepare temporary URDF folder with joint states recorded
-            # Place intermediate data inside the object's artifact folder so
-            # the container mount can access it.
+            # Prepare temporary URDF folder with joint states recorded.
+            # IMPORTANT: the default GraspGen container used by this repo mounts
+            # GraspGenModels -> /models. It does NOT mount the ArticuBot repo.
+            # So we must place temp URDF folders under GraspGenModels.
             import shutil, uuid
-            urdf_parent = pathlib.Path(urdf_path).resolve().parent
-            tmp_dir = str(urdf_parent / f"_tmp_{uuid.uuid4().hex[:8]}")
+            gg_cfg = GraspGenConfig()
+            tmp_root = pathlib.Path(gg_cfg.host_graspgen_root).resolve() / "_articubot_tmp"
+            tmp_root.mkdir(parents=True, exist_ok=True)
+            tmp_dir = str(tmp_root / f"_tmp_{uuid.uuid4().hex[:8]}")
             pathlib.Path(tmp_dir).mkdir(parents=True, exist_ok=True)
             try:
-                prepared = prepare_urdf_with_joint_state(urdf_path, joint_states, tmp_dir, scale=1.0)
-                # Configure GraspGenConfig so host<->container path mapping matches runtime mounts
-                # Detect asset version and compute correct GraspGen root path
-                # For v2 assets: URDF is in urdf/ subfolder, asset_dir is 1 level up
-                urdf_path_obj = pathlib.Path(urdf_path).resolve()
-                version = detect_asset_version(urdf_path_obj.parent.parent) if urdf_path_obj.parent.name == "urdf" else 1
-                
-                if version == 2:
-                    # v2: URDF at asset_dir/urdf/*.urdf, asset_dir is urdf_parent.parent
-                    asset_dir = urdf_path_obj.parent.parent
-                else:
-                    # v1: URDF at asset_dir/*.urdf
-                    asset_dir = urdf_path_obj.parent
-                
-                host_root = get_graspgen_host_root_for_asset(asset_dir)
-                gg_cfg = GraspGenConfig(
-                    host_graspgen_root=host_root,
-                    container_graspgen_root="/workspace/data",
+                prepared = prepare_urdf_with_joint_state(
+                    urdf_path, joint_states, tmp_dir, scale=float(object_scale)
                 )
                 grasps, confidences = predict_grasps_for_urdf_folder(prepared, gg_cfg)
                 if len(confidences) == 0:
@@ -520,6 +551,12 @@ def _custom_gen_init_state(
                 config_dict['initial_joint_angles'] = str(tuple(initial_joint_angles))
             if 'initial_finger_angle' not in config_dict:
                 config_dict['initial_finger_angle'] = initial_finger_angle
+        # Save object joint angle randomization (similar to gen_demo.py)
+        if "set_joint_angle_object_name" in config_dict:
+            config_dict['set_joint_angle_object_name'] = object_name
+            if handle_joint_id is not None:
+                config_dict['set_joint_angle_joint_id'] = handle_joint_id
+                config_dict['set_joint_angle_joint_angle'] = random_object_joint_angle if random_object_joint_angle is not None else 0.0
              
     with open(config_path, 'w') as f:
         yaml.dump(config, f, indent=4)

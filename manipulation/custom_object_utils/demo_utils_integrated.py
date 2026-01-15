@@ -224,18 +224,16 @@ def _custom_gen_init_state_integrated(
             jstate = p.getJointState(object_id, ji, physicsClientId=env.id)[0]
             joint_states[jname] = float(jstate)
         
-        # Prepare temporary URDF folder
-        urdf_parent = pathlib.Path(urdf_path).resolve().parent
-        tmp_dir = str(urdf_parent / f"_tmp_{uuid.uuid4().hex[:8]}")
+        # Prepare temporary URDF folder in a location that the GraspGen container can see.
+        # In the default setup, GraspGenModels is mounted to /models, not the ArticuBot repo.
+        gg_cfg = GraspGenConfig()
+        tmp_root = pathlib.Path(gg_cfg.host_graspgen_root).resolve() / "_articubot_tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        tmp_dir = str(tmp_root / f"_tmp_{uuid.uuid4().hex[:8]}")
         pathlib.Path(tmp_dir).mkdir(parents=True, exist_ok=True)
         
         try:
             prepared = prepare_urdf_with_joint_state(urdf_path, joint_states, tmp_dir, scale=object_scale)
-            host_root = get_graspgen_host_root_for_asset(pathlib.Path(urdf_path).resolve().parent)
-            gg_cfg = GraspGenConfig(
-                host_graspgen_root=host_root,
-                container_graspgen_root="/workspace/data",
-            )
             grasps, confidences = predict_grasps_for_urdf_folder(prepared, gg_cfg)
             
             if len(confidences) == 0:

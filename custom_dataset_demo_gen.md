@@ -111,10 +111,15 @@ python manipulation/gen_demo_custom.py \
     --asset-dir data/custom_objects/sim_microwave_good \
     --exp-name sim_microwave_demos \
     --size-scale 1.0 1.0 \
+    --joint-angle-range 0.0 0.0 \
     --num-to-generate 50
 ```
 
 The joint angles will remain at the default state specified in `base_config.yaml` (typically 0.0 for all joints).
+
+Note:
+- If `predicted_grasps.yml` exists and you enable scale or joint randomization, `gen_demo_custom.py` will automatically enforce `--size-scale 1.0 1.0` and `--joint-angle-range 0.0 0.0` to avoid grasp mismatches.
+- To force grasp generation per randomized state, use `--grasp-source ondemand` (requires GraspGen Docker running).
 
 ### Option B: On-Demand Grasp Generation
 

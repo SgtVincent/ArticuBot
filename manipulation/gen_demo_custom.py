@@ -107,6 +107,21 @@ def parse_args() -> argparse.Namespace:
                         help="Position randomization (meters)")
     parser.add_argument("--size-scale", type=float, nargs=2, default=(0.8, 1.1),
                         help="Scale randomization range")
+    parser.add_argument("--joint-angle-range", type=float, nargs=2, default=(0.0, 0.2),
+                        help="Object joint angle randomization range as fraction of joint limits. "
+                             "Default (0.0, 0.2) means joint will be opened 0-20%% of its full range, "
+                             "similar to the original gen_demo.py behavior.")
+    parser.add_argument(
+        "--grasp-source",
+        type=str,
+        default="ondemand",
+        choices=["auto", "precomputed", "ondemand"],
+        help=(
+            "How to obtain grasps: 'ondemand' queries GraspGen for each randomized object state; "
+            "'precomputed' forces predicted_grasps.yml (and disables scale/joint randomization to avoid mismatches); "
+            "'auto' is treated as 'ondemand' (recommended) to avoid grasp mismatches under randomization."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducibility")
     
@@ -237,6 +252,16 @@ def validate_and_prepare_args(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Annotation JSON not found at {args.annotation_path}")
     if not args.urdf_path.exists():
         raise FileNotFoundError(f"URDF path not found at {args.urdf_path}")
+
+    # Grasp-source policy:
+    # For randomized scale/joint configs, pre-generated grasps generally mismatch.
+    # Treat 'auto' as 'ondemand' to avoid accidentally using predicted_grasps.yml.
+    if args.grasp_source == "auto":
+        cprint(
+            "WARNING: --grasp-source auto is treated as ondemand to ensure grasps match randomized object states.",
+            "yellow",
+        )
+        args.grasp_source = "ondemand"
     
     # Validate integrated_inverse specific requirements
     if args.sampling_method == "integrated_inverse":
@@ -255,7 +280,18 @@ def load_grasps(args: argparse.Namespace) -> Optional[Tuple[np.ndarray, np.ndarr
         Tuple of (grasps, confidences) or None if not available.
     """
     predicted_grasps_path = args.asset_dir / "predicted_grasps.yml"
-    predicted_grasps = None
+    predicted_grasps: Optional[Tuple[np.ndarray, np.ndarray]] = None
+
+    if args.grasp_source == "ondemand":
+        cprint(
+            "Grasp source: ondemand (ignoring predicted_grasps.yml if present).", "cyan"
+        )
+        return None
+
+    if args.grasp_source == "precomputed" and not predicted_grasps_path.exists():
+        raise FileNotFoundError(
+            f"--grasp-source precomputed requires {predicted_grasps_path}"
+        )
     
     if predicted_grasps_path.exists():
         print(f"Loading predicted grasps from {predicted_grasps_path}")
@@ -276,8 +312,29 @@ def load_grasps(args: argparse.Namespace) -> Optional[Tuple[np.ndarray, np.ndarr
                 cprint("ENFORCING: Setting --size-scale to (1.0, 1.0) to prevent grasp mismatches.", "yellow")
                 cprint("=" * 70, "yellow")
                 args.size_scale = (1.0, 1.0)
+
+            # Enforce fixed joint angle for pre-generated grasps
+            jmin, jmax = tuple(args.joint_angle_range)
+            if abs(jmin) > 1e-9 or abs(jmax) > 1e-9:
+                cprint("=" * 70, "yellow")
+                cprint("WARNING: Pre-generated grasps detected (predicted_grasps.yml exists).", "yellow")
+                cprint("Grasps are computed for a FIXED object state (scale=1.0, default joints).", "yellow")
+                cprint(f"Your --joint-angle-range ({jmin}, {jmax}) enables joint randomization.", "yellow")
+                cprint(
+                    "ENFORCING: Setting --joint-angle-range to (0.0, 0.0) to prevent grasp mismatches.",
+                    "yellow",
+                )
+                cprint("=" * 70, "yellow")
+                args.joint_angle_range = (0.0, 0.0)
     else:
-        cprint("No predicted_grasps.yml found. Will use on-demand GraspGen for each randomized state.", "cyan")
+        if args.grasp_source == "precomputed":
+            raise FileNotFoundError(
+                f"--grasp-source precomputed requires {predicted_grasps_path}"
+            )
+        cprint(
+            "No predicted_grasps.yml found. Will use on-demand GraspGen for each randomized state.",
+            "cyan",
+        )
     
     return predicted_grasps
 
@@ -352,6 +409,7 @@ def run_heuristic_generation(args: argparse.Namespace,
             urdf_path=args.urdf_path,
             predicted_grasps=predicted_grasps,
             target_position=tuple(args.target_position),
+            joint_angle_range=tuple(args.joint_angle_range),
         )
         
         cprint(f"[HEURISTIC] Attempt {attempt+1}/{args.max_try_times}: {variant_path.name}", "cyan")
@@ -442,6 +500,7 @@ def run_integrated_inverse_generation(args: argparse.Namespace,
             urdf_path=args.urdf_path,
             predicted_grasps=predicted_grasps,
             target_position=tuple(args.target_position),
+            joint_angle_range=tuple(args.joint_angle_range),
         )
         
         cprint(f"[INTEGRATED_INVERSE] Attempt {attempt+1}/{args.max_try_times}: {variant_path.name}", "magenta")
