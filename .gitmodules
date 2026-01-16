@@ -4,3 +4,6 @@
 [submodule "third_party/GraspGen"]
 	path = third_party/GraspGen
 	url = https://github.com/SgtVincent/GraspGen.git
+[submodule "third_party/tracikpy"]
+	path = third_party/tracikpy
+	url = https://github.com/mjd3/tracikpy.git
