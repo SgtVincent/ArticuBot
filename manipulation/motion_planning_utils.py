@@ -119,7 +119,11 @@ def motion_planning(env, target_pos, target_orientation, planner=None,
         else:
             cprint(f"[MP] try_idx: {try_idx}, IK succeeded with {len(solutions) if robot_target_joint_angle is None else 1} solutions", "cyan")
         
-        for planner in ["RRTstar", "BITstar", "ABITstar"]:
+        # Use RRTConnect first (bidirectional, fast) and return immediately on success.
+        # Only fall back to asymptotically-optimal planners if needed.
+        # This avoids running 3 expensive planners when one suffices.
+        planners_to_try = ["RRTConnect", "RRTstar", "BITstar"]
+        for planner in planners_to_try:
             pb_ompl_interface.set_planner(planner)
             # then plan using ompl
             assert len(target_joint_angle) == ompl_robot.num_dim
@@ -137,12 +141,19 @@ def motion_planning(env, target_pos, target_orientation, planner=None,
                 path_translation_lengths.append(translation_length)
                 path_rotation_lengths.append(rotation_length)
                 ompl_robot.set_state(current_joint_angles)
-                # cprint(f"try_idx: {try_idx}, planner: {planner}, translation length: {translation_length}, rotation length: {rotation_length}", "red")
+                # Early exit: for demo generation, any valid path is good enough.
+                # Return immediately to avoid wasting time on additional planners.
+                break
+        
+        # Early exit from the outer try_idx loop: once we have a valid path, no need to keep trying more IK solutions.
+        if len(paths) > 0:
+            break
     
     if len(paths) == 0:
         return None, None, None, None
     
     ompl_robot.set_state(current_joint_angles)    
+    # With early exit, we typically have just one path, so ranking is fast.
     rank_translation = np.argsort(path_translation_lengths)
     rank_rotation = np.argsort(path_rotation_lengths)
     total_rank = rank_translation + rank_rotation
