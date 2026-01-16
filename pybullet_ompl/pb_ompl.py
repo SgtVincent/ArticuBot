@@ -312,6 +312,8 @@ class PbOMPL():
         '''
         self.goal = list(goal)
         start = self.robot.get_cur_state()
+        # Critical: Update self.start so is_state_valid() bypasses collision check for the actual start state
+        self.start = list(start)
         res, path = self.plan_start_goal(start, goal, allowed_time=allowed_time, smooth_path=smooth_path)
         return res, path
     
