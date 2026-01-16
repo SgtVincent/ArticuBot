@@ -61,10 +61,24 @@ pip install -e .
 ```
 pip install fpsample
 ```
-The installtaion might give an error which requires you to install Rust first. Following the prompt in the installtaion error message should be sufficient. 
+The installation might give an error which requires you to install Rust first. Follow the prompt in the installation error message.
 If the installation runs into any other issue, check https://github.com/leonardodalinky/fpsample.
 
-- (Optional) In addition to pybullet's default IK solver, we use tracIK as an additional ik solver which might be more accurate and give better IK solutions. If you wish to install tracIK, follow instructions here: https://github.com/mjd3/tracikpy. 
+- (Optional) In addition to pybullet's default IK solver, we use tracIK as an additional IK solver which might be more accurate. We now provide `tracikpy` as a git submodule at `third_party/tracikpy` and it is installed automatically when creating the `articubot` conda environment from `environment.yaml` (it is included as a pip editable install). If you already have the environment active, install it manually:
+
+```
+git submodule update --init --recursive third_party/tracikpy
+conda activate articubot
+pip install -e third_party/tracikpy
+```
+
+**Note:** `tracikpy` requires some system packages on Ubuntu. For example:
+
+```
+sudo apt-get install libeigen3-dev liborocos-kdl-dev libkdl-parser-dev liburdfdom-dev libnlopt-dev libnlopt-cxx-dev
+```
+
+Alternatively, run `scripts/install_tracikpy.sh` after activating the `articubot` environment to initialize the submodule and install it.
 
 The above should be sufficient for training and evaluating articubot policies. 
 
