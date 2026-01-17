@@ -184,6 +184,9 @@ def integrated_sample_initial_state(
     base_euler: np.ndarray,
     config: IntegratedSamplingConfig,
     debug_vis_path: Optional[str] = None,
+    heatmap_dir: Optional[str] = None,
+    save_heatmaps: bool = False,
+    heatmap_per_waypoint: bool = False,
     object_z_offset: float = 0.0,
     viser_visualizer = None,
     attempt_number: int = 0,
@@ -280,6 +283,32 @@ def integrated_sample_initial_state(
                 temperature=config.temperature,
             )
             print(f"  Pre-sampled {len(sampled_poses)} candidate poses")
+
+        # Dump heatmaps for offline inspection (even if max_score < threshold).
+        if save_heatmaps or heatmap_dir is not None:
+            try:
+                from manipulation.custom_object_utils.debug_visualization import (
+                    dump_integrated_inverse_heatmaps,
+                )
+                dump_integrated_inverse_heatmaps(
+                    heatmap_dir if heatmap_dir is not None else f"heatmaps_attempt_{attempt_number:04d}",
+                    x_grid=np.asarray(x_grid),
+                    y_grid=np.asarray(y_grid),
+                    theta_grid=np.asarray(theta_grid),
+                    integrated_scores=np.asarray(scores),
+                    sampler=sampler,
+                    trajectory_obj=trajectory_obj if heatmap_per_waypoint else None,
+                    base_euler=np.asarray(base_euler, dtype=float),
+                    z_height=float(object_z),
+                    object_pos=None,
+                    save_per_waypoint=bool(heatmap_per_waypoint),
+                    write_npz=True,
+                    write_png=True,
+                )
+            except Exception as e:
+                import traceback
+                print(f"  Warning: Failed to dump heatmaps: {e}")
+                traceback.print_exc()
     
     # Try sampled poses first (from integrated distribution)
     for pose_idx, (obj_pos, obj_quat, score) in enumerate(sampled_poses):
@@ -304,6 +333,26 @@ def integrated_sample_initial_state(
         
         if success:
             print(f"  Found valid configuration at pose {pose_idx}")
+
+            # Record selected pose in heatmap folder.
+            if (save_heatmaps or heatmap_dir is not None) and scores is not None:
+                try:
+                    import json
+                    out_dir = pathlib.Path(heatmap_dir) if heatmap_dir is not None else pathlib.Path(f"heatmaps_attempt_{attempt_number:04d}")
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    (out_dir / "selected_pose.json").write_text(
+                        json.dumps(
+                            {
+                                "pose_idx": int(pose_idx),
+                                "score": float(score),
+                                "object_pos": np.asarray(obj_pos, dtype=float).tolist(),
+                                "object_quat": np.asarray(obj_quat, dtype=float).tolist(),
+                            },
+                            indent=2,
+                        )
+                    )
+                except Exception:
+                    pass
             
             # Save debug visualization if requested (GIF)
             if debug_vis_path is not None and scores is not None:
@@ -435,6 +484,25 @@ def integrated_sample_initial_state(
                 return True, obj_pos, obj_quat, joint_angles
     
     print(f"Failed to find valid initial state after {config.max_pose_samples} attempts")
+
+    # If heatmaps were requested and we computed a distribution, mark failure.
+    if (save_heatmaps or heatmap_dir is not None) and scores is not None:
+        try:
+            import json
+            out_dir = pathlib.Path(heatmap_dir) if heatmap_dir is not None else pathlib.Path(f"heatmaps_attempt_{attempt_number:04d}")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "success": False,
+                        "attempt_number": int(attempt_number),
+                        "n_sampled_poses": int(len(sampled_poses)),
+                    },
+                    indent=2,
+                )
+            )
+        except Exception:
+            pass
     return False, np.zeros(3), np.zeros(4), np.zeros(7)
 
 

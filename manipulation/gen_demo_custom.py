@@ -177,6 +177,28 @@ def parse_args() -> argparse.Namespace:
                         help="Save debug visualization as GIF showing trajectory poses and inverse map values")
     parser.add_argument("--debug-vis-output", type=pathlib.Path, default=None,
                         help="Output path for debug visualization GIF (defaults to <exp-dir>/debug_vis.gif)")
+    parser.add_argument(
+        "--save-heatmaps",
+        action="store_true",
+        help=(
+            "Dump integrated-inverse heatmaps for offline inspection. Writes the full (x,y,theta) score grid "
+            "as .npz and saves a PNG for every theta slice under a per-attempt folder."
+        ),
+    )
+    parser.add_argument(
+        "--heatmap-output-dir",
+        type=pathlib.Path,
+        default=None,
+        help="Base output directory for heatmaps (default: <experiment-dir>/heatmaps)",
+    )
+    parser.add_argument(
+        "--heatmap-per-waypoint",
+        action="store_true",
+        help=(
+            "Also dump per-waypoint inverse reachability heatmaps (best-theta) and arrays. "
+            "This can be slower and generate many files."
+        ),
+    )
     parser.add_argument("--init-only", action="store_true",
                         help="Only run initial-state sampling (and write config/init-state); skip full demo execution")
     parser.add_argument("--use-viser", action="store_true",
@@ -247,6 +269,9 @@ def validate_and_prepare_args(args: argparse.Namespace) -> None:
 
     if args.rm4d_map is not None:
         args.rm4d_map = pathlib.Path(args.rm4d_map).expanduser().resolve(strict=False)
+
+    if args.heatmap_output_dir is not None:
+        args.heatmap_output_dir = pathlib.Path(args.heatmap_output_dir).expanduser().resolve(strict=False)
 
     if not args.annotation_path.exists():
         raise FileNotFoundError(f"Annotation JSON not found at {args.annotation_path}")
@@ -512,6 +537,12 @@ def run_integrated_inverse_generation(args: argparse.Namespace,
                 debug_vis_path = str(args.debug_vis_output)
             else:
                 debug_vis_path = str(experiment_path / f"debug_vis_attempt_{attempt:04d}.gif")
+
+        # Determine heatmap dump folder (per attempt)
+        heatmap_dir = None
+        if getattr(args, "save_heatmaps", False):
+            base_dir = args.heatmap_output_dir if args.heatmap_output_dir is not None else (experiment_path / "heatmaps")
+            heatmap_dir = str(pathlib.Path(base_dir) / f"attempt_{attempt:04d}")
         
         # Generate initial state using integrated inverse map method
         success_init = custom_gen_init_state_integrated(
@@ -536,6 +567,9 @@ def run_integrated_inverse_generation(args: argparse.Namespace,
             use_viser=args.use_viser,
             viser_port=args.viser_port,
             attempt_number=attempt,
+            save_heatmaps=bool(getattr(args, "save_heatmaps", False)),
+            heatmap_dir=heatmap_dir,
+            heatmap_per_waypoint=bool(getattr(args, "heatmap_per_waypoint", False)),
         )
         
         if not success_init:

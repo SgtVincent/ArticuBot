@@ -59,6 +59,9 @@ def _custom_gen_init_state_integrated(
     asset_dir: Optional[str] = None,
     debug_vis_path: Optional[str] = None,
     object_z_offset: float = 0.0,
+    save_heatmaps: bool = False,
+    heatmap_dir: Optional[str] = None,
+    heatmap_per_waypoint: bool = False,
     use_viser: bool = False,
     viser_port: int = 8080,
     attempt_number: int = 0,
@@ -91,6 +94,9 @@ def _custom_gen_init_state_integrated(
         target_ratio: Target opening ratio for manipulation.
         asset_dir: Path to asset directory.
         debug_vis_path: Optional path to save debug visualization GIF.
+        save_heatmaps: Whether to dump heatmaps (png + npz) for offline inspection.
+        heatmap_dir: Output directory to dump heatmaps for this attempt.
+        heatmap_per_waypoint: Whether to also dump per-waypoint heatmaps (best-theta).
         object_z_offset: Z-offset to elevate object above ground.
         use_viser: Whether to enable interactive viser visualization.
         viser_port: Port number for viser server.
@@ -380,6 +386,9 @@ def _custom_gen_init_state_integrated(
         sampling_config,
         debug_vis_path=debug_vis_path,
         object_z_offset=object_z_offset,
+        heatmap_dir=heatmap_dir,
+        save_heatmaps=bool(save_heatmaps),
+        heatmap_per_waypoint=bool(heatmap_per_waypoint),
         viser_visualizer=viser_visualizer,
         attempt_number=attempt_number,
         object_urdf_path=object_urdf_path,
@@ -456,6 +465,9 @@ def custom_gen_init_state_integrated(
     asset_dir: Optional[str] = None,
     debug_vis_path: Optional[str] = None,
     object_z_offset: float = 0.0,
+    save_heatmaps: bool = False,
+    heatmap_dir: Optional[str] = None,
+    heatmap_per_waypoint: bool = False,
     use_viser: bool = False,
     viser_port: int = 8080,
     attempt_number: int = 0,
@@ -516,6 +528,9 @@ def custom_gen_init_state_integrated(
             asset_dir,
             debug_vis_path,
             object_z_offset,
+            bool(save_heatmaps),
+            heatmap_dir,
+            bool(heatmap_per_waypoint),
             use_viser,
             viser_port,
             attempt_number,

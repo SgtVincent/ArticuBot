@@ -14,6 +14,7 @@ by showing:
 """
 from __future__ import annotations
 
+import json
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend for subprocess
@@ -958,3 +959,137 @@ def create_debug_gif(
         output_path=output_path,
         include_per_waypoint=False,
     )
+
+
+def dump_integrated_inverse_heatmaps(
+    output_dir: str | Path,
+    *,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    theta_grid: np.ndarray,
+    integrated_scores: np.ndarray,
+    sampler=None,
+    trajectory_obj: Optional[Sequence[Tuple[np.ndarray, np.ndarray]]] = None,
+    base_euler: Optional[np.ndarray] = None,
+    z_height: Optional[float] = None,
+    object_pos: Optional[np.ndarray] = None,
+    save_per_waypoint: bool = False,
+    write_npz: bool = True,
+    write_png: bool = True,
+) -> None:
+    """Dump integrated-inverse heatmaps to disk.
+
+    This is intended for offline inspection/debugging. It saves:
+    - `meta.json` (stats + best theta index)
+    - `integrated_distribution.npz` (x/y/theta grids + 3D scores)
+    - `integrated_theta_XXX.png` for every theta slice (optional)
+    - Optional per-waypoint heatmaps at best theta:
+      - `per_waypoint_scores_best_theta.npz`
+      - `per_waypoint_wp_XXXX_best_theta.png` for each waypoint
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Basic stats
+    scores = np.asarray(integrated_scores)
+    theta_sums = np.sum(scores, axis=(0, 1))
+    best_theta_idx = int(np.argmax(theta_sums)) if theta_sums.size > 0 else 0
+    max_score = float(np.max(scores)) if scores.size > 0 else 0.0
+    mean_nonzero = float(np.mean(scores[scores > 0])) if np.any(scores > 0) else 0.0
+    n_valid = int(np.sum(scores > 0))
+
+    meta = {
+        "grid": {
+            "nx": int(len(x_grid)),
+            "ny": int(len(y_grid)),
+            "ntheta": int(len(theta_grid)),
+        },
+        "stats": {
+            "n_valid_score_gt_0": n_valid,
+            "max_score": max_score,
+            "mean_score_nonzero": mean_nonzero,
+            "best_theta_idx": best_theta_idx,
+            "best_theta_rad": float(theta_grid[best_theta_idx]) if len(theta_grid) > 0 else 0.0,
+            "best_theta_deg": float(np.degrees(theta_grid[best_theta_idx])) if len(theta_grid) > 0 else 0.0,
+        },
+        "z_height": float(z_height) if z_height is not None else None,
+        "object_pos": np.asarray(object_pos, dtype=float).tolist() if object_pos is not None else None,
+        "base_euler": np.asarray(base_euler, dtype=float).tolist() if base_euler is not None else None,
+        "has_sampler": bool(sampler is not None),
+    }
+    (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
+    if write_npz:
+        np.savez_compressed(
+            out_dir / "integrated_distribution.npz",
+            x_grid=np.asarray(x_grid, dtype=np.float32),
+            y_grid=np.asarray(y_grid, dtype=np.float32),
+            theta_grid=np.asarray(theta_grid, dtype=np.float32),
+            scores=np.asarray(scores, dtype=np.float32),
+        )
+
+    if write_png:
+        png_dir = out_dir / "integrated_theta_slices"
+        png_dir.mkdir(parents=True, exist_ok=True)
+        for theta_idx in range(int(len(theta_grid))):
+            fig = plot_integrated_inverse_map(
+                x_grid=np.asarray(x_grid),
+                y_grid=np.asarray(y_grid),
+                theta_grid=np.asarray(theta_grid),
+                scores=np.asarray(scores),
+                theta_index=int(theta_idx),
+                object_pos=np.asarray(object_pos, dtype=float) if object_pos is not None else None,
+                sampled_poses=None,
+                title="Integrated Inverse Map",
+            )
+            fig.savefig(png_dir / f"integrated_theta_{int(theta_idx):03d}.png", dpi=150)
+            plt.close(fig)
+
+    # Optional: per-waypoint maps (saved at best theta only, for tractability)
+    if save_per_waypoint and sampler is not None and trajectory_obj is not None and hasattr(sampler, "rmap"):
+        if base_euler is None or z_height is None:
+            # Per-waypoint grids need these to match integrated distribution.
+            return
+
+        per_wp_dir = out_dir / "per_waypoint_best_theta"
+        per_wp_dir.mkdir(parents=True, exist_ok=True)
+
+        per_wp_scores = compute_per_waypoint_scores_grid(
+            sampler.rmap,
+            trajectory_obj,
+            np.asarray(x_grid),
+            np.asarray(y_grid),
+            np.asarray(theta_grid),
+            float(z_height),
+            np.asarray(base_euler, dtype=float),
+        )
+        # Store a compact representation for the best theta only.
+        per_wp_best_theta = per_wp_scores[:, :, :, int(best_theta_idx)].astype(np.uint8)
+        if write_npz:
+            np.savez_compressed(
+                per_wp_dir / "per_waypoint_scores_best_theta.npz",
+                best_theta_idx=int(best_theta_idx),
+                best_theta_rad=float(theta_grid[best_theta_idx]) if len(theta_grid) > 0 else 0.0,
+                best_theta_deg=float(np.degrees(theta_grid[best_theta_idx])) if len(theta_grid) > 0 else 0.0,
+                per_wp_best_theta=per_wp_best_theta,
+            )
+
+        if write_png:
+            for wp_idx in range(int(per_wp_scores.shape[0])):
+                fig, ax = plt.subplots(figsize=(10, 8))
+                im = plot_per_waypoint_heatmap_on_ax(
+                    ax,
+                    np.asarray(x_grid),
+                    np.asarray(y_grid),
+                    np.asarray(theta_grid),
+                    per_wp_scores[int(wp_idx)],
+                    waypoint_idx=int(wp_idx),
+                    theta_index=int(best_theta_idx),
+                    object_pos=np.asarray(object_pos, dtype=float) if object_pos is not None else None,
+                    ee_pos_world=None,
+                    title="Per-Waypoint Inverse Reachability (best θ)",
+                )
+                fig.colorbar(im, ax=ax).set_label("Reachable (1) / Not Reachable (0)")
+                fig.tight_layout()
+                fig.savefig(per_wp_dir / f"per_waypoint_wp_{int(wp_idx):04d}_best_theta.png", dpi=150)
+                plt.close(fig)
