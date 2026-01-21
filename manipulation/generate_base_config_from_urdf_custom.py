@@ -31,6 +31,7 @@ from manipulation.custom_object_utils.object_utils import (
     ensure_handle_mesh_from_annotation,
     ensure_mobility_file,
     extract_joint_metadata,
+    find_annotation_path,
     find_first_urdf,
     get_urdf_parent_dir,
     quaternion_from_euler,
@@ -92,10 +93,10 @@ def build_config_dict(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate base_config for custom URDF")
-    parser.add_argument("--asset-folder", default="data/URDF_with_affordance", help="Folder containing URDF, mesh/, annotation.json (supports both v1 and v2 layouts)")
+    parser.add_argument("--asset-folder", default="data/URDF_with_affordance", help="Folder containing URDF, mesh/, affordance.txt (supports both v1 and v2 layouts)")
     parser.add_argument("--output-root", default="data/custom_objects_v2", help="Root folder for processed assets")
     parser.add_argument("--dataset-name", default=None, help="Name for the processed asset folder")
-    parser.add_argument("--annotation", default=None, help="Path to annotation.json (defaults to <asset-folder>/annotation.json)")
+    parser.add_argument("--annotation", default=None, help="Path to affordance.txt (defaults to <asset-folder>/affordance.txt)")
     parser.add_argument("--joint-name", default=None, help="Name of revolute/prismatic joint to treat as handle")
     parser.add_argument("--handle-name", default=None, help="Override handle name (defaults to child link name)")
     parser.add_argument("--handle-part-id", type=int, default=1, help="Part id used when writing parts_render/<id><handle>.obj")
@@ -132,16 +133,15 @@ def main() -> None:
     # Find annotation (try root level first, then standard locations)
     annotation_src = None
     if args.annotation:
-        annotation_src = Path(args.annotation).expanduser().resolve()
-    else:
-        # Try root level first (both v1 and v2)
-        annotation_src = src_dir / "annotation.json"
-        if not annotation_src.exists():
-            # v2 might have it at root level
-            annotation_src = src_dir / "annotation.json"
-    
-    if not annotation_src.exists():
-        raise FileNotFoundError(f"Annotation JSON not found at {annotation_src}")
+        annotation_src = Path(args.annotation).expanduser().resolve(strict=False)
+        if annotation_src.suffix.lower() not in {".txt", ".pts", ".xyz"}:
+            raise ValueError(
+                f"Affordance file must be a text file (affordance.txt), got {annotation_src}"
+            )
+    if annotation_src is None or not annotation_src.exists():
+        annotation_src = find_annotation_path(src_dir, annotation_src)
+    if annotation_src is None or not annotation_src.exists():
+        raise FileNotFoundError(f"Annotation file not found under {src_dir}")
     annotation_dst = ensure_annotation_copy(annotation_src, dst_dir)
 
     # Compute target URDF path in destination directory

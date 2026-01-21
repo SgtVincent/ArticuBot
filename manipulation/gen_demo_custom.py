@@ -39,6 +39,7 @@ from manipulation.custom_object_utils.object_utils import (
     find_first_urdf,
     ensure_support_files,
     load_predicted_grasps,
+    find_annotation_path,
 )
 from manipulation.custom_object_utils.demo_utils import (
     parse_config_metadata,
@@ -94,18 +95,18 @@ def parse_args() -> argparse.Namespace:
     
     # Object configuration
     parser.add_argument("--annotation-path", type=pathlib.Path, default=None,
-                        help="Path to annotation.json file")
+                        help="Path to affordance.txt file (Nx3 points)")
     parser.add_argument("--handle-part-id", type=int, default=1,
                         help="Part ID for handle mesh")
     parser.add_argument("--handle-padding", type=float, default=0.0,
                         help="Padding for handle bounding box")
-    parser.add_argument("--handle-dilate", type=float, default=0.01,
-                        help="Dilation (meters) to expand annotation bbox for handle extraction")
+    parser.add_argument("--handle-dilate", type=float, default=0.0,
+                        help="Dilation (meters) to expand affordance bbox for handle extraction")
     
     # Randomization parameters
     parser.add_argument("--center-jitter", type=float, default=0.05,
                         help="Position randomization (meters)")
-    parser.add_argument("--size-scale", type=float, nargs=2, default=(0.8, 1.1),
+    parser.add_argument("--size-scale", type=float, nargs=2, default=(0.8, 1.5),
                         help="Scale randomization range")
     parser.add_argument("--joint-angle-range", type=float, nargs=2, default=(0.0, 0.2),
                         help="Object joint angle randomization range as fraction of joint limits. "
@@ -144,8 +145,9 @@ def parse_args() -> argparse.Namespace:
     # Object placement
     parser.add_argument("--target-position", type=float, nargs=3, default=(0.4, 0.0, 0.0),
                         help="Target world position (x, y, z) for object placement")
-    parser.add_argument("--object-z-offset", type=float, default=0.0,
-                        help="Z-offset to elevate object above ground (e.g., 0.7 for table height)")
+    parser.add_argument("--object-z-offset", type=float, nargs='+', default=[0.3, 0.7],
+                        help="Z-offset to elevate object above ground (e.g., 0.7 for table height). "
+                             "If two values provided, randomizes between them.")
     
     # RM4D parameters (used by integrated inverse sampling)
     parser.add_argument("--rm4d-map", type=pathlib.Path, default=None,
@@ -247,20 +249,30 @@ def validate_and_prepare_args(args: argparse.Namespace) -> None:
     args._handle_name = handle_name
     args._solution_path = solution_path
     
+    resolved_annotation = None
     if args.annotation_path is not None:
-        args.annotation_path = pathlib.Path(args.annotation_path).expanduser().resolve(strict=False)
+        resolved_annotation = pathlib.Path(args.annotation_path).expanduser().resolve(strict=False)
+        if resolved_annotation.suffix.lower() not in {".txt", ".pts", ".xyz"}:
+            raise ValueError(
+                f"Affordance file must be a text file (affordance.txt), got {resolved_annotation}"
+            )
     elif annotation_hint:
-        p_cwd = pathlib.Path(annotation_hint).resolve()
-        p_rel = resolve_relative_path(annotation_hint, config_parent)
-        
-        if p_cwd.exists():
-            args.annotation_path = p_cwd
-        elif p_rel.exists():
-            args.annotation_path = p_rel
-        else:
-            args.annotation_path = p_rel
-    else:
-        args.annotation_path = (args.asset_dir / "annotation.json").resolve(strict=False)
+        hint_path = pathlib.Path(str(annotation_hint))
+        if hint_path.suffix.lower() in {".txt", ".pts", ".xyz"}:
+            p_cwd = hint_path.resolve()
+            p_rel = resolve_relative_path(annotation_hint, config_parent)
+
+            if p_cwd.exists():
+                resolved_annotation = p_cwd
+            elif p_rel.exists():
+                resolved_annotation = p_rel
+            else:
+                resolved_annotation = p_rel
+
+    if resolved_annotation is None or not resolved_annotation.exists():
+        resolved_annotation = find_annotation_path(args.asset_dir, resolved_annotation or annotation_hint)
+
+    args.annotation_path = resolved_annotation
 
     if args.urdf_path is not None:
         args.urdf_path = pathlib.Path(args.urdf_path).expanduser().resolve(strict=False)
@@ -544,6 +556,15 @@ def run_integrated_inverse_generation(args: argparse.Namespace,
             base_dir = args.heatmap_output_dir if args.heatmap_output_dir is not None else (experiment_path / "heatmaps")
             heatmap_dir = str(pathlib.Path(base_dir) / f"attempt_{attempt:04d}")
         
+        # Determine Z-offset for this attempt
+        if isinstance(args.object_z_offset, list) and len(args.object_z_offset) == 2:
+            current_z_offset = random.uniform(args.object_z_offset[0], args.object_z_offset[1])
+        elif isinstance(args.object_z_offset, list) and len(args.object_z_offset) == 1:
+            current_z_offset = args.object_z_offset[0]
+        else:
+             # Fallback if somehow scalar (though nargs='+' makes it a list)
+            current_z_offset = args.object_z_offset if not isinstance(args.object_z_offset, list) else args.object_z_offset[0]
+
         # Generate initial state using integrated inverse map method
         success_init = custom_gen_init_state_integrated(
             str(variant_path),
@@ -563,7 +584,7 @@ def run_integrated_inverse_generation(args: argparse.Namespace,
             target_ratio=args.target_ratio,
             asset_dir=str(args.asset_dir),
             debug_vis_path=debug_vis_path,
-            object_z_offset=args.object_z_offset,
+            object_z_offset=current_z_offset,
             use_viser=args.use_viser,
             viser_port=args.viser_port,
             attempt_number=attempt,

@@ -800,7 +800,7 @@ def create_summary_frame(
     Returns:
         Matplotlib figure.
     """
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(18, 8))
     
     # Top-left: Waypoint score histogram
     ax = axes[0, 0]

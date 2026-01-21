@@ -56,20 +56,23 @@ def detect_asset_version(asset_dir: os.PathLike | str) -> int:
 
 
 def load_scale_from_file(asset_dir: os.PathLike | str) -> Optional[float]:
-    """Load scale factor from scale.txt if present (v2 format).
+    """Load scale factor from scale.txt or scale.text if present (v2 format).
     
     Returns:
         Scale factor as float, or None if not found.
     """
     asset_path = _ensure_path(asset_dir)
-    
-    # Try v2 location: urdf/scale.txt
-    scale_path = asset_path / "urdf" / "scale.txt"
-    if not scale_path.exists():
-        # Also try root level
-        scale_path = asset_path / "scale.txt"
-    
-    if scale_path.exists():
+
+    candidates = [
+        asset_path / "urdf" / "scale.txt",
+        asset_path / "urdf" / "scale.text",
+        asset_path / "scale.txt",
+        asset_path / "scale.text",
+    ]
+
+    for scale_path in candidates:
+        if not scale_path.exists():
+            continue
         try:
             with scale_path.open("r") as f:
                 return float(f.read().strip())
@@ -188,9 +191,39 @@ def collect_mesh_paths(urdf_root: Path, tree: ET.ElementTree) -> List[Path]:
     return paths
 
 
+def find_annotation_path(asset_dir: os.PathLike | str, hint: Optional[os.PathLike | str] = None) -> Optional[Path]:
+    asset_path = _ensure_path(asset_dir)
+    candidates: List[Path] = []
+
+    if hint:
+        hint_path = _ensure_path(hint)
+        if hint_path.suffix.lower() in {".txt", ".pts", ".xyz"}:
+            candidates.append(hint_path)
+            if not hint_path.is_absolute():
+                candidates.append((asset_path / hint_path).resolve(strict=False))
+                candidates.append((asset_path / "urdf" / hint_path).resolve(strict=False))
+
+    name_candidates = [
+        "affordance.txt",
+        "affordances.txt",
+    ]
+    for name in name_candidates:
+        candidates.append(asset_path / name)
+        candidates.append(asset_path / "urdf" / name)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def ensure_support_files(asset_dir: Path, args, handle_name: str) -> None:
-    annotation_path = args.annotation_path or (asset_dir / "annotation.json")
-    if annotation_path.exists():
+    annotation_path = None
+    if args.annotation_path is not None:
+        annotation_path = _ensure_path(args.annotation_path)
+    if annotation_path is None or not annotation_path.exists():
+        annotation_path = find_annotation_path(asset_dir, annotation_path)
+    if annotation_path is not None and annotation_path.exists():
         ensure_handle_mesh_from_annotation(
             asset_dir,
             handle_name,
@@ -205,9 +238,9 @@ def ensure_support_files(asset_dir: Path, args, handle_name: str) -> None:
         ensure_mobility_file(asset_dir, joint_info, overwrite=True)
 
     # If annotation exists, compute a handle point cloud from mesh vertices inside bbox
-    if args.annotation_path is not None and args.urdf_path is not None:
+    if annotation_path is not None and args.urdf_path is not None:
         try:
-            ann_pts = load_annotation_points(args.annotation_path)
+            ann_pts = load_annotation_points(annotation_path)
         except Exception:
             ann_pts = None
         if ann_pts is not None:
@@ -409,8 +442,8 @@ def ensure_support_files(asset_dir: Path, args, handle_name: str) -> None:
                     )
                     from scipy.spatial import cKDTree
                     tree = cKDTree(v_all)
-                    r = max(float(args.handle_dilate), 0.01)
-                    max_r = 0.10
+                    r = max(float(args.handle_dilate), 0.002)
+                    max_r = 0.05
                     collected_idx, r = _collect_nearby_vertex_indices(
                         tree,
                         ann_pts_used,
@@ -444,8 +477,8 @@ def ensure_support_files(asset_dir: Path, args, handle_name: str) -> None:
                     from scipy.spatial import cKDTree
 
                     tree = cKDTree(v_all)
-                    r0 = max(float(args.handle_dilate), 0.01)
-                    max_r = 0.10
+                    r0 = max(float(args.handle_dilate), 0.002)
+                    max_r = 0.05
                     collected_idx, r = _collect_nearby_vertex_indices(
                         tree,
                         ann_pts_used,
@@ -550,14 +583,35 @@ def compute_object_size(urdf_path: Path, override: Optional[float] = None, asset
 
 def load_annotation_points(annotation_path: os.PathLike | str) -> np.ndarray:
     annotation_file = _ensure_path(annotation_path)
+    if not annotation_file.exists():
+        raise FileNotFoundError(f"Affordance file not found: {annotation_file}")
+
+    if annotation_file.suffix.lower() not in {".txt", ".pts", ".xyz"}:
+        raise ValueError(
+            f"Affordance file must be a text file with Nx3 points, got {annotation_file}"
+        )
+
+    points: List[List[float]] = []
     with annotation_file.open("r", encoding="utf-8") as fp:
-        data = json.load(fp)
-    points = data.get("affordable_points") or data.get("affordance_points")
+        for line in fp:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            line = line.replace(",", " ")
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                points.append([float(parts[0]), float(parts[1]), float(parts[2])])
+            except ValueError:
+                continue
+
     if not points:
-        raise ValueError(f"No affordable_points found in {annotation_file}")
+        raise ValueError(f"No affordance points found in {annotation_file}")
+
     pts = np.asarray(points, dtype=float)
     if pts.ndim != 2 or pts.shape[1] != 3:
-        raise ValueError(f"Annotation points must be Nx3, got shape {pts.shape}")
+        raise ValueError(f"Affordance points must be Nx3, got shape {pts.shape}")
     return pts
 
 
@@ -829,6 +883,7 @@ __all__ = [
     "detect_asset_version",
     "load_scale_from_file",
     "get_urdf_parent_dir",
+    "find_annotation_path",
     "compute_config_metadata",
     "compute_object_size",
     "determine_reward_asset_path",
