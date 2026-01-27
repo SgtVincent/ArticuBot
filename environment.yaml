@@ -119,12 +119,13 @@ dependencies:
   - zlib=1.2.13=h5eee18b_0
   - zstd=1.5.2=ha4553b6_0
   # trac_ik dependencies 
-  - swig 
+  # can be installed via conda or apt
+  # - swig 
   # - orocos-kdl 
-  - conda-forge::python-orocos-kdl
+  # - conda-forge::python-orocos-kdl
   # NOTE: if you want to change the installed ros distribution, please change the name
   # - robostack::ros-noetic-kdl-parser
-  - nlopt
+  # - nlopt
 
   - pip:
       - absl-py==1.4.0
@@ -451,3 +452,7 @@ dependencies:
       - ypy-websocket==0.8.4
       - zipp==3.15.0
       - gym==0.21.0
+      # custom dependencies
+      - trimesh==4.11.0
+      - viser==1.0.17
+      - open3d==0.19.0

@@ -197,11 +197,19 @@ def _docker_exec(config: GraspGenConfig, shell_cmd: str, *, timeout: Optional[fl
         "exec",
         "-w",
         config.container_workdir,
+    ]
+    
+    # Propagate CUDA_VISIBLE_DEVICES if set, to distribute load across GPUs
+    # when running multiple parallel instances.
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        docker_cmd.extend(["-e", f"CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"])
+
+    docker_cmd.extend([
         config.container_name,
         "bash",
         "-lc",
         shell_cmd,
-    ]
+    ])
     return subprocess.run(
         docker_cmd,
         capture_output=True,
@@ -367,9 +375,15 @@ def run_graspgen_in_docker(
     inner_cmd = " ".join(cmd_parts)
     docker_cmd = [
         "docker", "exec", "-w", config.container_workdir,
+    ]
+
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        docker_cmd.extend(["-e", f"CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"])
+
+    docker_cmd.extend([
         config.container_name,
         "bash", "-c", inner_cmd,
-    ]
+    ])
     
     print(f"[GraspGen] Running: docker exec {config.container_name} bash -c '{inner_cmd}'")
     

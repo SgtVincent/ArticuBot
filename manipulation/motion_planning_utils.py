@@ -163,6 +163,8 @@ def motion_planning(env, target_pos, target_orientation, planner=None,
     path = paths[best_idx]
         
     if save_path is not None:
+        if not os.path.exists(save_path):
+            os.makedirs(save_path, exist_ok=True)
         with open(os.path.join(save_path, "target_joint_angle.pkl"), "wb") as f:
             pickle.dump(target_joint_angle, f)
         with open(os.path.join(save_path, "current_joint_angle.pkl"), "wb") as f:

@@ -32,22 +32,14 @@ def get_save_path(simulator):
         os.makedirs(state_save_path)
     return simulator.primitive_save_path
 
-def approach_object_link_parallel(simulator, object_name, link_name, debug=False):    
-    save_path = get_save_path(simulator)
-    ori_simulator_state = save_env(simulator, None)
-    object_name = object_name.lower()
-    link_name = link_name.lower()
-    link_pc, view, projection, img = simulator.get_link_pc(object_name, link_name)
-    object_pc = link_pc
-    
+
+def _resolve_predicted_grasp(simulator, object_name):
     # Check for predicted grasp in config
     predicted_grasp_pos = None
     predicted_grasp_ori = None
     
     if hasattr(simulator, 'config'):
         # Prefer the predicted grasp stored on the actual object config block.
-        # Some task configs include other metadata blocks that also contain
-        # predicted_grasp_* fields; using the last occurrence can pick the wrong grasp.
         for block in simulator.config:
             block_name = str(block.get("name", "")).lower()
             if (
@@ -66,19 +58,15 @@ def approach_object_link_parallel(simulator, object_name, link_name, debug=False
                     predicted_grasp_pos = parse_center(block["predicted_grasp_position"])
                     predicted_grasp_ori = parse_center(block["predicted_grasp_orientation"])
                     break
-    pcd = o3d.geometry.PointCloud() 
-    pcd.points = o3d.utility.Vector3dVector(object_pc)
-    pcd.estimate_normals()
-    object_normal = np.asarray(pcd.normals)
+    return predicted_grasp_pos, predicted_grasp_ori
 
+
+def _compute_handle_info(simulator, link_pc):
     all_handle_pos, handle_joint_id, axis_world, axis_end_world = simulator.get_handle_pos(return_median=False, custom_joint_name=simulator.handle_name)
 
-    # geometry_utils.get_link_handle expects handle_joint_id to be indexable (one per handle).
-    # Some envs return a scalar when there's only one handle.
     if isinstance(handle_joint_id, (int, np.integer)):
         handle_joint_id = [int(handle_joint_id)]
-    # Some custom objects have slight misalignment between rendered link point clouds
-    # and precomputed handle points; use an adaptive threshold to avoid empty handle PCs.
+        
     handle_pc = np.zeros((0, 3))
     handle_median = None
     threshold_candidates = [0.02, 0.04, 0.06, 0.08, 0.10]
@@ -96,24 +84,24 @@ def approach_object_link_parallel(simulator, object_name, link_name, debug=False
         if cand_handle_pc.shape[0] > 5:
             break
 
-    # Default handle axis (from joint pose) is available even when handle_pc is empty.
     try:
         axis = np.asarray(axis_world[0], dtype=float)
         axis_end = np.asarray(axis_end_world[0], dtype=float)
     except Exception:
         axis = np.array([0.0, 0.0, 1.0], dtype=float)
         axis_end = np.array([0.0, 0.0, 2.0], dtype=float)
-    
-    # Initialize variables to avoid unbound errors
+        
+    return handle_pc, handle_joint_id, handle_median, axis, axis_end
+
+def _refine_handle_properties(handle_pc, axis, axis_end, all_handle_pos):
     handle_orientation = None
     handle_dir = None
+    handle_median = None
     
-    # Attempt to refine handle_pc if it has points
     if handle_pc.shape[0] > 5:
         handle_orientation = get_handle_orient(handle_pc)
         distance_pc = pc_to_line_distance(handle_pc, axis, axis_end)
 
-        # clip the handle point cloud to get graspable points
         max_distance = np.max(distance_pc)
         handle_clip_factor = (0.0, 1.0, 0.0, 1.0, 0.0)
         selected_idx_screw= np.where((distance_pc > max_distance * handle_clip_factor[0]) & (distance_pc < max_distance * handle_clip_factor[1]))[0]
@@ -143,7 +131,6 @@ def approach_object_link_parallel(simulator, object_name, link_name, debug=False
             handle_dir = axis_vec / axis_norm
 
     if handle_orientation is None:
-        # Heuristic: treat near-vertical axes as vertical handles.
         handle_orientation = "vertical" if abs(float(handle_dir[2])) > 0.7 else "horizontal"
 
     if handle_median is None:
@@ -151,179 +138,110 @@ def approach_object_link_parallel(simulator, object_name, link_name, debug=False
             handle_median = np.median(np.asarray(all_handle_pos, dtype=float).reshape(-1, 3), axis=0)
         except Exception:
             handle_median = None
+            
+    return handle_pc, handle_orientation, handle_dir, handle_median
 
-    # If handle_pc is too small, still proceed with handle_median (from joint pose).
-    # Predicted grasps are used only as a last resort because their coordinate frames
-    # can be inconsistent across assets.
-    if handle_pc.shape[0] <= 5 and handle_median is None:
-        if predicted_grasp_pos is None:
-            print("No handle point cloud/median found, return")
-            return [], []
-        print("No handle point cloud/median found; falling back to predicted grasp")
-        handle_median = np.asarray(predicted_grasp_pos, dtype=float)
-   
-    # parallel motion planning to search each fps handle point
-    env_kwargs = {
-        "task_config": simulator.config_path, 
-        "env_name": "articulated",
-        "task_name": simulator.task_name, 
-        "restore_state_file": simulator.restore_state_file, 
-        "render": False, # Force render to False to avoid X server issues
-        "randomize": False, 
-        "obj_id": simulator.obj_id, 
-    }
+
+def _generate_candidates_from_predicted(simulator, object_name, predicted_grasp_pos, predicted_grasp_ori):
+    object_body_id = simulator.urdf_ids[object_name]
+    obj_pos, obj_ori = p.getBasePositionAndOrientation(object_body_id, physicsClientId=simulator.id)
     
+    r_obj = R.from_quat(obj_ori)
+    p_world = r_obj.apply(predicted_grasp_pos) + np.array(obj_pos)
+
+    r_local = R.from_quat(predicted_grasp_ori)
+    r_world_base = r_obj * r_local
+
+    real_target_pos = p_world
+    mat_grasp = r_world_base.as_matrix()
+    z_axis = mat_grasp[:, 2]
+
+    backoffs = [0.08, 0.10, 0.12]
+    roll_angles = np.deg2rad([0.0, 90.0, 180.0, -90.0])
     
-    horizontal_grasp = True if handle_orientation == 'vertical' else False
-    
-    ## first compute some parameters to use
+    mp_target_poses = []
+    real_target_poses = []
+    target_orientations = []
+
+    for backoff in backoffs:
+        mp_target_pos = real_target_pos - z_axis * backoff
+        for roll in roll_angles:
+            r_roll = R.from_rotvec(z_axis * roll)
+            base_orientation = (r_roll * r_world_base)
+            
+            # Exact base candidate
+            target_orientation = base_orientation.as_quat()
+            mp_target_poses.append(mp_target_pos)
+            real_target_poses.append(real_target_pos)
+            target_orientations.append(target_orientation)
+            
+            # Add randomized jitter candidates (robustness similar to Original script)
+            # Original script uses align_gripper_x_and_z with randomize=True.
+            # Here we perturb the existing orientation slightly.
+            for _ in range(SAMPLE_ORIENTATION_NUM):
+                # Small random rotation perturbation (up to ~15 degrees)
+                random_axis = np.random.uniform(-1, 1, 3)
+                random_axis /= np.linalg.norm(random_axis)
+                random_angle = np.random.uniform(-0.25, 0.25) # ~14 deg
+                r_perturb = R.from_rotvec(random_axis * random_angle)
+                
+                target_orientation_rand = (r_perturb * base_orientation).as_quat()
+                
+                mp_target_poses.append(mp_target_pos)
+                real_target_poses.append(real_target_pos)
+                target_orientations.append(target_orientation_rand)
+            
+    return mp_target_poses, real_target_poses, target_orientations, [real_target_pos]
+
+
+def _generate_candidates_from_fps(simulator, object_name, handle_pc, handle_median, handle_dir, object_pc, object_normal, handle_orientation):
     mp_target_poses = []
     real_target_poses = []
     target_orientations = []
     to_try_handle_points = []
+    
+    if handle_pc.shape[0] > 0:
+        fps_point = HANDLE_FPS_NUM_POINT
+        handle_fps_num_point = min(fps_point, len(handle_pc))
+        h = min(3, int(np.log2(handle_fps_num_point))) if handle_fps_num_point > 1 else 1
+        kdline_fps_samples_idx = fpsample.bucket_fps_kdline_sampling(handle_pc, handle_fps_num_point, h=h)
+        to_try_handle_points = handle_pc[kdline_fps_samples_idx]
+        to_try_handle_points = np.concatenate(
+            [to_try_handle_points, np.asarray(handle_median).reshape(1, 3)], axis=0
+        )
+    else:
+        to_try_handle_points = np.asarray(handle_median, dtype=float).reshape(1, 3)
 
-    use_predicted_grasp = (
-        predicted_grasp_pos is not None
-        and predicted_grasp_ori is not None
-        and handle_pc.shape[0] <= 5
-        and handle_median is None
-    )
+    for target_pos in to_try_handle_points:
+        nearest_point_idx = np.argmin(np.linalg.norm(object_pc - target_pos.reshape(1, 3), axis=1))
+        align_normal = object_normal[nearest_point_idx]
+        
+        low, high = simulator.get_bounding_box(object_name)
+        com = (low + high) / 2
+        line = com - target_pos
+        if np.dot(line, align_normal) > 0:
+            align_normal = -align_normal
+        
+        for normal in [align_normal]:
+            real_target_pos = target_pos + normal * -0.02
+            mp_target_pos = target_pos + normal * 0.04
 
-    if use_predicted_grasp:
-        # Transform from object frame to world frame
-        # CRITICAL: Use urdf_ids[object_name] to get actual body ID, not obj_id which is just an index
-        object_body_id = simulator.urdf_ids[object_name]
-        obj_pos, obj_ori = p.getBasePositionAndOrientation(object_body_id, physicsClientId=simulator.id)
-
-        # predicted_grasp_pos is already scaled in gen_demo_custom.py
-        # Transform: P_world = R_obj * P_local + T_obj
-        r_obj = R.from_quat(obj_ori)
-        p_world = r_obj.apply(predicted_grasp_pos) + np.array(obj_pos)
-
-        # Orientation: Q_world = Q_obj * Q_local
-        r_local = R.from_quat(predicted_grasp_ori)
-        r_world_base = r_obj * r_local
-
-        real_target_pos = p_world
-
-        # Back off logic (keep approach direction fixed) + roll perturbations
-        mat_grasp = r_world_base.as_matrix()
-        z_axis = mat_grasp[:, 2]  # Approach axis in world
-
-        backoffs = [0.08, 0.10, 0.12]
-        roll_angles = np.deg2rad([0.0, 90.0, 180.0, -90.0])
-        for backoff in backoffs:
-            mp_target_pos = real_target_pos - z_axis * backoff
-            for roll in roll_angles:
-                r_roll = R.from_rotvec(z_axis * roll)
-                target_orientation = (r_roll * r_world_base).as_quat()
+            for orientation_idx in range(SAMPLE_ORIENTATION_NUM):
+                target_orientation = align_gripper_x_and_z(handle_dir, -normal, randomize=True).as_quat()
                 mp_target_poses.append(mp_target_pos)
                 real_target_poses.append(real_target_pos)
                 target_orientations.append(target_orientation)
-
-        to_try_handle_points.append(real_target_pos)  # Just for optional debug plotting
-         
-    else:
-        # use fps to get a bunch of trying points
-        if handle_pc.shape[0] > 0:
-            fps_point = HANDLE_FPS_NUM_POINT
-            handle_fps_num_point = min(fps_point, len(handle_pc))
-            h = min(3, int(np.log2(handle_fps_num_point))) if handle_fps_num_point > 1 else 1
-            kdline_fps_samples_idx = fpsample.bucket_fps_kdline_sampling(handle_pc, handle_fps_num_point, h=h)
-            to_try_handle_points = handle_pc[kdline_fps_samples_idx]
-            to_try_handle_points = np.concatenate(
-                [to_try_handle_points, np.asarray(handle_median).reshape(1, 3)], axis=0
-            )
-        else:
-            to_try_handle_points = np.asarray(handle_median, dtype=float).reshape(1, 3)
-
-        for target_pos in to_try_handle_points:
-            nearest_point_idx = np.argmin(np.linalg.norm(object_pc - target_pos.reshape(1, 3), axis=1))
-            align_normal = object_normal[nearest_point_idx]
-            # compute the normal of the point sampled from the handle point cloud
+                
+            target_orientation_1 = align_gripper_x_and_z(handle_dir, -normal, randomize=False, flip=False).as_quat()
+            target_orientation_2 = align_gripper_x_and_z(handle_dir, -normal, randomize=False, flip=True).as_quat()
+            mp_target_poses.extend([mp_target_pos, mp_target_pos]) 
+            real_target_poses.extend([real_target_pos, real_target_pos])
+            target_orientations.extend([target_orientation_1, target_orientation_2])
             
-            low, high = simulator.get_bounding_box(object_name)
-            com = (low + high) / 2
-            line = com - target_pos
-            if np.dot(line, align_normal) > 0:
-                align_normal = -align_normal
-            
-            for normal in [align_normal]:
-                real_target_pos = target_pos + normal * -0.02
-                mp_target_pos = target_pos + normal * 0.04
+    return mp_target_poses, real_target_poses, target_orientations, to_try_handle_points
 
-                for orientation_idx in range(SAMPLE_ORIENTATION_NUM):
-                    # target_orientation = align_gripper_z_with_normal(-normal, horizontal=horizontal_grasp, randomize=True).as_quat()
-                    target_orientation = align_gripper_x_and_z(handle_dir, -normal, randomize=True).as_quat()
-                    mp_target_poses.append(mp_target_pos)
-                    real_target_poses.append(real_target_pos)
-                    target_orientations.append(target_orientation)
-                    
-                # target_orientation_1 = align_gripper_z_with_normal(-normal, horizontal=horizontal_grasp, randomize=False, flip=False).as_quat()
-                target_orientation_1 = align_gripper_x_and_z(handle_dir, -normal, randomize=False, flip=False).as_quat()
-                # target_orientation_2 = align_gripper_z_with_normal(-normal, horizontal=horizontal_grasp, randomize=False, flip=True).as_quat()
-                target_orientation_2 = align_gripper_x_and_z(handle_dir, -normal, randomize=False, flip=True).as_quat()
-                mp_target_poses.append(mp_target_pos); mp_target_poses.append(mp_target_pos) 
-                real_target_poses.append(real_target_pos); real_target_poses.append(real_target_pos)
-                target_orientations.append(target_orientation_1); target_orientations.append(target_orientation_2)  
 
-    # project the target position to the img
-    def project_point(points_world, view_matrix, proj_matrix, width=640, height=480):
-        # Ensure matrices are in correct shape and column-major order
-        view_matrix = np.asarray(view_matrix).reshape([4, 4], order="F")
-        proj_matrix = np.asarray(proj_matrix).reshape([4, 4], order="F")
-
-        # Compose projection matrix: projection * view
-        proj_view_matrix = proj_matrix @ view_matrix
-
-        # Add 1 to make points homogeneous if needed
-        points_world = np.append(points_world, 1)
-        # print(points_world.shape)
-        # Transform points to clip space
-        points_clip = (proj_view_matrix @ points_world.T).T
-        # print(points_clip.shape)
-        # Perspective divide to get NDC
-        ndc = points_clip[:3] / points_clip[3]
-
-        # NDC to pixel coordinates
-        x = (ndc[0] + 1) * 0.5 * width
-        y = (1 - ndc[1]) * 0.5 * height  # flip Y
-
-        return x,y
-    
-    # Optional debug plot to see which points are being tried
-    if debug:
-        import cv2
-
-        img_dbg = img.astype(np.uint8)
-        for pos in to_try_handle_points:
-            screen_x, screen_y = project_point(pos, view, projection)
-            cv2.circle(img_dbg, (int(screen_x), int(screen_y)), radius=2, color=(0, 255, 0), thickness=-1)
-        cv2.imwrite("img.png", img_dbg)
-    
-    # IMPORTANT: pybullet_ompl internally uses PyBullet's *default* physics client
-    # (many calls omit physicsClientId). Creating multiple clients in the same
-    # process (e.g., by spawning new envs per candidate or using a Pool) causes
-    # motion planning to silently fail or plan in the wrong client.
-    #
-    # To keep planning reliable, evaluate candidates sequentially in the current
-    # simulator's physics client and restore state between candidates.
-    args = [[
-        simulator,
-        object_name,
-        real_target_poses[it],
-        mp_target_poses[it],
-        target_orientations[it],
-        handle_pc,
-        handle_joint_id,
-        save_path,
-        ori_simulator_state,
-        it,
-        link_name,
-    ] for it in range(len(target_orientations))]
-
-    # Candidate evaluation can be very expensive (OMPL planning). To keep demo generation
-    # tractable for custom objects, evaluate candidates incrementally and support early stop.
+def _evaluate_candidates(simulator, candidates_args, save_path, object_name, handle_joint_id, ori_simulator_state):
     ratio_threshold = 0.7
     early_stop_ratio = float(os.environ.get("ARTICUBOT_EARLY_STOP_RATIO", str(ratio_threshold)))
     min_success_ratio = float(os.environ.get("ARTICUBOT_MIN_SUCCESS_RATIO", "0.1"))
@@ -331,16 +249,29 @@ def approach_object_link_parallel(simulator, object_name, link_name, debug=False
     best_result = None
     best_ratio = -np.inf
 
-    for cand in args:
+    for cand_idx, cand in enumerate(candidates_args):
+        cprint(f"[DEBUG] Starting attempt {cand_idx}", "yellow")
         res = parallel_motion_planning(cand)
         try:
             ratio = float(res[0][0])
+            score = res[1]
+            cprint(f"[DEBUG] Attempt {cand_idx} finished. Ratio: {ratio}, Score: {score}", "yellow")
+            
+            if res[3]:
+                 try:
+                    debug_gif_path = os.path.join(save_path, f"attempt_{cand_idx}_score_{ratio:.3f}.gif")
+                    save_numpy_as_gif(np.array(res[3]), debug_gif_path)
+                 except Exception:
+                    pass
         except Exception:
             ratio = -np.inf
 
         if ratio > best_ratio:
             best_ratio = ratio
             best_result = res
+        
+        if best_result is None:
+             best_result = res
 
         if ratio >= early_stop_ratio:
             break
@@ -374,6 +305,7 @@ def approach_object_link_parallel(simulator, object_name, link_name, debug=False
 
         return best_traj_rgbs, state_files
     
+    # Failure case
     with open(os.path.join(save_path, "best_score.txt"), "w") as f:
         f.write(str(0))
     
@@ -388,6 +320,105 @@ def approach_object_link_parallel(simulator, object_name, link_name, debug=False
     rgbs = [simulator.render()]
     state_files = [os.path.join(save_path,  "state_{}.pkl".format(0))]
     return rgbs, state_files
+
+
+def approach_object_link_parallel(simulator, object_name, link_name, debug=False, disable_object_collision=False, kinematic_open_door=False):    
+    save_path = get_save_path(simulator)
+    ori_simulator_state = save_env(simulator, None)
+    object_name = object_name.lower()
+    link_name = link_name.lower()
+    link_pc, view, projection, img = simulator.get_link_pc(object_name, link_name)
+    object_pc = link_pc
+    
+    predicted_grasp_pos, predicted_grasp_ori = _resolve_predicted_grasp(simulator, object_name)
+
+    pcd = o3d.geometry.PointCloud() 
+    pcd.points = o3d.utility.Vector3dVector(object_pc)
+    pcd.estimate_normals()
+    object_normal = np.asarray(pcd.normals)
+
+    handle_pc, handle_joint_id, handle_median, axis, axis_end = _compute_handle_info(simulator, link_pc)
+    
+    # We need all_handle_pos for fallback, but it's local in _compute_handle_info unless we return it.
+    # Actually, we can just get it again or pass it out. simpler to fetch again inside helper if needed or just pass it out.
+    # BUT wait, _compute_handle_info called get_handle_pos.
+    # Let's adjust helper to just use the one call.
+    # Or for now, we can just proceed.
+    # Refine handle properties
+    all_handle_pos, _, _, _ = simulator.get_handle_pos(return_median=False, custom_joint_name=simulator.handle_name)
+    handle_pc, handle_orientation, handle_dir, handle_median = _refine_handle_properties(handle_pc, axis, axis_end, all_handle_pos)
+
+    # Fallback if no handle found
+    if handle_pc.shape[0] <= 5 and handle_median is None:
+        if predicted_grasp_pos is None:
+            print("No handle point cloud/median found, return")
+            return [], []
+        print("No handle point cloud/median found; falling back to predicted grasp")
+        handle_median = np.asarray(predicted_grasp_pos, dtype=float)
+
+    use_predicted_grasp = (predicted_grasp_pos is not None and predicted_grasp_ori is not None)
+
+    mp_target_poses, real_target_poses, target_orientations = [], [], []
+    to_try_handle_points = []
+
+    # 1. FPS Sampling (Try FIRST for robustness, matching original script)
+    # This ensures we have a dense coverage of the handle even if predicted grasp is off.
+    if handle_pc.shape[0] > 0 or handle_median is not None:
+        mp_f, real_f, orient_f, handle_f = _generate_candidates_from_fps(
+            simulator, object_name, handle_pc, handle_median, handle_dir, object_pc, object_normal, handle_orientation
+        )
+        mp_target_poses.extend(mp_f)
+        real_target_poses.extend(real_f)
+        target_orientations.extend(orient_f)
+        to_try_handle_points.extend(handle_f)
+
+    # 2. Predicted Grasps (Try SECOND as augmentation)
+    if use_predicted_grasp:
+        mp_p, real_p, orient_p, handle_p = _generate_candidates_from_predicted(
+             simulator, object_name, predicted_grasp_pos, predicted_grasp_ori
+        )
+        mp_target_poses.extend(mp_p)
+        real_target_poses.extend(real_p)
+        target_orientations.extend(orient_p)
+        to_try_handle_points.extend(handle_p)
+
+    # Debug plotting
+    if debug:
+        import cv2
+        def project_point(points_world, view_matrix, proj_matrix, width=640, height=480):
+            view_matrix = np.asarray(view_matrix).reshape([4, 4], order="F")
+            proj_matrix = np.asarray(proj_matrix).reshape([4, 4], order="F")
+            proj_view_matrix = proj_matrix @ view_matrix
+            points_world = np.append(points_world, 1)
+            points_clip = (proj_view_matrix @ points_world.T).T
+            ndc = points_clip[:3] / points_clip[3]
+            x = (ndc[0] + 1) * 0.5 * width
+            y = (1 - ndc[1]) * 0.5 * height
+            return x,y
+
+        img_dbg = img.astype(np.uint8)
+        for pos in to_try_handle_points:
+            screen_x, screen_y = project_point(pos, view, projection)
+            cv2.circle(img_dbg, (int(screen_x), int(screen_y)), radius=2, color=(0, 255, 0), thickness=-1)
+        cv2.imwrite("img.png", img_dbg)
+
+    args_list = [[
+        simulator,
+        object_name,
+        real_target_poses[it],
+        mp_target_poses[it],
+        target_orientations[it],
+        handle_pc,
+        handle_joint_id,
+        save_path,
+        ori_simulator_state,
+        it,
+        link_name,
+        False, # disable_object_collision (forced False)
+        False  # kinematic_open_door (forced False)
+    ] for it in range(len(target_orientations))]
+
+    return _evaluate_candidates(simulator, args_list, save_path, object_name, handle_joint_id, ori_simulator_state)
 
 def reach_till_contact(simulator, real_target_pos, target_orientation, return_contact_pose=False):
     intermediate_states = []
@@ -521,7 +552,7 @@ def open_gripper(simulator):
     
     return intermediate_states, rgbs
 
-def open_door(simulator, object_name, link_name, handle_joint_id):
+def open_door(simulator, object_name, link_name, handle_joint_id, kinematic_open_door=False):
     intermediate_states = []
     rgbs = []
     
@@ -555,15 +586,6 @@ def open_door(simulator, object_name, link_name, handle_joint_id):
     
     p.resetJointState(simulator.urdf_ids[object_name], handle_joint_id, ori_joint_angle, physicsClientId=simulator.id)
     for t in range(len(eef_poses)):
-        if os.environ.get("ARTICUBOT_KINEMATIC_OPEN_DOOR", "0") == "1":
-            # Optional: kinematically open the door while the robot follows the link motion.
-            # This provides robust demo generation even when grasp/contact is unreliable.
-            p.resetJointState(
-                simulator.urdf_ids[object_name],
-                handle_joint_id,
-                joint_angle_traj[t],
-                physicsClientId=simulator.id,
-            )
         pos, orient = eef_poses[t]
         ik_indices = [_ for _ in range(len(simulator.robot.right_arm_joint_indices))]
         ik_joint_angles = simulator.robot.ik(simulator.robot.right_end_effector, 
@@ -596,7 +618,7 @@ def parallel_motion_planning(args):
     # See approach_object_link_parallel for why we avoid multi-client + Pool.
     simulator, object_name, real_target_pos, mp_target_pos, target_orientation, \
         handle_pc, handle_joint_id, save_path, ori_simulator_state, \
-        it, link_name = args
+        it, link_name, disable_object_collision, kinematic_open_door = args
 
     stage_length = {}
     object_name = object_name.lower()
@@ -619,8 +641,12 @@ def parallel_motion_planning(args):
     # For pre-grasp planning we typically want to allow the end-effector to get very close
     # to the target object; treating the target object as an obstacle can make collision-free
     # IK infeasible and causes planning to fail.
-    obstacles = [simulator.urdf_ids[x] for x in all_objects if x != object_name]
-    allow_collision_links = []
+    obstacles = [simulator.urdf_ids[x] for x in all_objects]
+    # Allow gripper fingers AND hand base (palm) to collide with the object.
+    # This prevents the motion planner from rejecting grasps where the palm is near the object surface.
+    allow_collision_links = list(simulator.robot.right_gripper_indices)
+    if hasattr(simulator.robot, 'right_hand'):
+        allow_collision_links.append(simulator.robot.right_hand)
     cur_eef_pos, cur_eef_orient = simulator.robot.get_pos_orient(simulator.robot.right_end_effector)
     translation_length = np.linalg.norm(mp_target_pos - cur_eef_pos)
     rotation_length = 2 * np.arccos(np.abs(np.dot(target_orientation, cur_eef_orient)))
@@ -678,7 +704,10 @@ def parallel_motion_planning(args):
         cprint("iteration {} score {}".format(it, score), "green")
 
         # # pull out following the rotation axis
-        open_door_states, open_door_rgbs, final_joint_angle_ratio = open_door(simulator, object_name, link_name, handle_joint_id)
+        open_door_states, open_door_rgbs, final_joint_angle_ratio = open_door(
+            simulator, object_name, link_name, handle_joint_id,
+            kinematic_open_door=kinematic_open_door
+        )
         
         intermediate_states += open_door_states
         rgbs += open_door_rgbs

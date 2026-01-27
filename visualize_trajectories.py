@@ -62,13 +62,13 @@ def get_successful_trajectories(experiment_path: str) -> List[str]:
         dp = os.path.join(experiment_path, d)
         if not os.path.isdir(dp):
             continue
-        if not os.path.exists(os.path.join(dp, 'all.gif')):
-            continue
+        # if not os.path.exists(os.path.join(dp, 'all.gif')):
+        #     continue
         states_dir = os.path.join(dp, 'states')
         if not os.path.exists(states_dir):
             continue
         state_files = [f for f in os.listdir(states_dir) if f.endswith('.pkl')]
-        if len(state_files) > 10:
+        if len(state_files) > 0:  # Allow partial trajectories
             successful.append(dp)
     return successful
 
@@ -510,6 +510,26 @@ def main():
             position=tuple(handle_approx.tolist()),
         )
         print(f"  Added approximate handle marker at {handle_approx}")
+
+        # Verification: Check distance from trajectory start to handle
+        print("\n  [VERIFICATION] Checking start-to-handle distances:")
+        distances = []
+        for i, traj_points in enumerate(all_eef_object_frame):
+            if len(traj_points) > 0:
+                start_pt = traj_points[0]
+                dist = np.linalg.norm(start_pt - handle_approx)
+                distances.append(dist)
+                status = "OK" if dist < 0.1 else "FAR"
+                print(f"    Traj {i}: start_dist={dist:.4f} m ({status})")
+        
+        if distances:
+            avg_dist = np.mean(distances)
+            print(f"  Average start distance: {avg_dist:.4f} m")
+            if avg_dist < 0.15:
+                print("  [PASS] Trajectories start near the handle.")
+            else:
+                print("  [FAIL] Trajectories start too far from handle (Scale mismatch still exists?)")
+
     else:
         print("  Warning: Could not load object mesh")
         # Add a placeholder box

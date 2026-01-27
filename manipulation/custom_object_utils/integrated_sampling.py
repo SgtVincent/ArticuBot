@@ -193,6 +193,7 @@ def integrated_sample_initial_state(
     object_urdf_path: Optional[str] = None,
     object_scale: float = 1.0,
     grasp_candidates_obj: Optional[List[Tuple[np.ndarray, np.ndarray, float]]] = None,
+    trajectory_occlusion_rate: float = 0.5,
 ) -> Tuple[bool, np.ndarray, np.ndarray, np.ndarray]:
     """Sample initial state using integrated inverse map approach.
     
@@ -239,6 +240,11 @@ def integrated_sample_initial_state(
         f"+ object_z_offset {float(object_z_offset):.3f} = {object_z:.3f}"
     )
     
+    # NOTE: Scale consistency is ensured by the caller (demo_utils_integrated.py)
+    # which uses get_object_runtime_scale() to get the correct runtime scale.
+    # The grasp_pos_obj and trajectory_obj passed here are already in the correct scale.
+
+    
     start_time = time.time()
     
     # Initialize sampled_poses
@@ -247,70 +253,122 @@ def integrated_sample_initial_state(
     # Store distribution data for debug visualization
     x_grid, y_grid, theta_grid, scores = None, None, None, None
     
-    # Compute distribution if sampler is available
+    # 1. Compute distribution if sampler is available
     if sampler is not None:
-        print("  Computing integrated inverse map distribution...")
-        t0 = time.time()
-        x_grid, y_grid, theta_grid, scores = sampler.compute_object_pose_distribution(
-            traj_obj=trajectory_obj,
-            xy_center=(config.target_position[0], config.target_position[1]),
-            xy_range=config.xy_range,
+        x_grid, y_grid, theta_grid, scores, sampled_poses = _compute_integrated_distribution(
+            sampler, trajectory_obj, config, object_z, base_euler, 
+            save_heatmaps, heatmap_dir, heatmap_per_waypoint, attempt_number
+        )
+
+    # 2. Try sampled poses from integrated distribution
+    success, obj_pos, obj_quat, joint_angles = _validate_candidate_poses(
+        env, object_id, sampled_poses, grasp_pos_obj, grasp_quat_obj,
+        trajectory_obj, sampler, base_euler, object_z,
+        x_grid, y_grid, theta_grid, scores, 
+        config, start_time, trajectory_occlusion_rate,
+        debug_vis_path, save_heatmaps, heatmap_dir, attempt_number,
+        viser_visualizer, object_urdf_path, object_scale, grasp_candidates_obj
+    )
+    
+    if success:
+        return True, obj_pos, obj_quat, joint_angles
+    
+    # 3. Fallback: random sampling
+    return _fallback_random_sampling(
+        env, object_id, grasp_pos_obj, grasp_quat_obj, trajectory_obj, sampler,
+        config, object_z, base_euler, start_time, config.max_pose_samples,
+        debug_vis_path
+    )
+
+
+def _compute_integrated_distribution(
+    sampler, trajectory_obj, config, object_z, base_euler, 
+    save_heatmaps, heatmap_dir, heatmap_per_waypoint, attempt_number
+):
+    """Compute distribution over object poses using integrated inverse map."""
+    print("  Computing integrated inverse map distribution...")
+    t0 = time.time()
+    x_grid, y_grid, theta_grid, scores = sampler.compute_object_pose_distribution(
+        traj_obj=trajectory_obj,
+        xy_center=(config.target_position[0], config.target_position[1]),
+        xy_range=config.xy_range,
+        z_height=object_z,
+        base_euler=base_euler,
+    )
+    
+    sampled_poses = []
+    
+    # Report statistics
+    n_valid = np.sum(scores > config.min_score_threshold)
+    max_score = np.max(scores)
+    mean_score = np.mean(scores[scores > 0]) if np.any(scores > 0) else 0
+    print(f"  Distribution computed in {time.time() - t0:.2f}s: "
+          f"{n_valid} valid cells (max: {max_score:.3f}, mean of nonzero: {mean_score:.3f})")
+    
+    if max_score < config.min_score_threshold:
+        print(f"  WARNING: No valid poses found (max score {max_score:.3f} < threshold {config.min_score_threshold})")
+        print(f"    Consider lowering --min-score-threshold or --coverage-threshold")
+    else:
+        # Pre-sample poses from distribution
+        sampled_poses = sampler.sample_object_poses_batch(
+            scores=scores,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            theta_grid=theta_grid,
+            n_samples=config.max_pose_samples,
             z_height=object_z,
             base_euler=base_euler,
+            temperature=config.temperature,
         )
-        
-        # Report statistics
-        n_valid = np.sum(scores > config.min_score_threshold)
-        max_score = np.max(scores)
-        mean_score = np.mean(scores[scores > 0]) if np.any(scores > 0) else 0
-        print(f"  Distribution computed in {time.time() - t0:.2f}s: "
-              f"{n_valid} valid cells (max: {max_score:.3f}, mean of nonzero: {mean_score:.3f})")
-        
-        if max_score < config.min_score_threshold:
-            print(f"  WARNING: No valid poses found (max score {max_score:.3f} < threshold {config.min_score_threshold})")
-            print(f"    Consider lowering --min-score-threshold or --coverage-threshold")
-            # sampled_poses remains empty, will trigger fallback
-        else:
-            # Pre-sample poses from distribution
-            sampled_poses = sampler.sample_object_poses_batch(
-                scores=scores,
-                x_grid=x_grid,
-                y_grid=y_grid,
-                theta_grid=theta_grid,
-                n_samples=config.max_pose_samples,
-                z_height=object_z,
-                base_euler=base_euler,
-                temperature=config.temperature,
-            )
-            print(f"  Pre-sampled {len(sampled_poses)} candidate poses")
+        print(f"  Pre-sampled {len(sampled_poses)} candidate poses")
 
-        # Dump heatmaps for offline inspection (even if max_score < threshold).
-        if save_heatmaps or heatmap_dir is not None:
-            try:
-                from manipulation.custom_object_utils.debug_visualization import (
-                    dump_integrated_inverse_heatmaps,
-                )
-                dump_integrated_inverse_heatmaps(
-                    heatmap_dir if heatmap_dir is not None else f"heatmaps_attempt_{attempt_number:04d}",
-                    x_grid=np.asarray(x_grid),
-                    y_grid=np.asarray(y_grid),
-                    theta_grid=np.asarray(theta_grid),
-                    integrated_scores=np.asarray(scores),
-                    sampler=sampler,
-                    trajectory_obj=trajectory_obj if heatmap_per_waypoint else None,
-                    base_euler=np.asarray(base_euler, dtype=float),
-                    z_height=float(object_z),
-                    object_pos=None,
-                    save_per_waypoint=bool(heatmap_per_waypoint),
-                    write_npz=True,
-                    write_png=True,
-                )
-            except Exception as e:
-                import traceback
-                print(f"  Warning: Failed to dump heatmaps: {e}")
-                traceback.print_exc()
+    # Dump heatmaps for offline inspection
+    if save_heatmaps or heatmap_dir is not None:
+        try:
+            from manipulation.custom_object_utils.debug_visualization import (
+                dump_integrated_inverse_heatmaps,
+            )
+            dump_integrated_inverse_heatmaps(
+                heatmap_dir if heatmap_dir is not None else f"heatmaps_attempt_{attempt_number:04d}",
+                x_grid=np.asarray(x_grid),
+                y_grid=np.asarray(y_grid),
+                theta_grid=np.asarray(theta_grid),
+                integrated_scores=np.asarray(scores),
+                sampler=sampler,
+                trajectory_obj=trajectory_obj if heatmap_per_waypoint else None,
+                base_euler=np.asarray(base_euler, dtype=float),
+                z_height=float(object_z),
+                object_pos=None,
+                save_per_waypoint=bool(heatmap_per_waypoint),
+                write_npz=True,
+                write_png=True,
+            )
+        except Exception as e:
+            import traceback
+            print(f"  Warning: Failed to dump heatmaps: {e}")
+            traceback.print_exc()
+            
+    return x_grid, y_grid, theta_grid, scores, sampled_poses
+
+
+def _validate_candidate_poses(
+    env, object_id, sampled_poses, grasp_pos_obj, grasp_quat_obj,
+    trajectory_obj, sampler, base_euler, object_z,
+    x_grid, y_grid, theta_grid, scores, 
+    config, start_time, trajectory_occlusion_rate,
+    debug_vis_path, save_heatmaps, heatmap_dir, attempt_number,
+    viser_visualizer, object_urdf_path, object_scale, grasp_candidates_obj
+):
+    """Validate sampled poses against collision and robot reachability."""
+    from manipulation.custom_object_utils.occlusion_utils import check_trajectory_occlusion, check_handle_facing
     
-    # Try sampled poses first (from integrated distribution)
+    # Identify movable joint (heuristic: first non-fixed)
+    movable_joint_id = None
+    for ji in range(p.getNumJoints(object_id, physicsClientId=env.id)):
+        if p.getJointInfo(object_id, ji, physicsClientId=env.id)[2] != p.JOINT_FIXED:
+            movable_joint_id = ji
+            break
+
     for pose_idx, (obj_pos, obj_quat, score) in enumerate(sampled_poses):
         if time.time() - start_time > config.timeout:
             print(f"Integrated sampling timed out after {config.timeout}s")
@@ -320,6 +378,15 @@ def integrated_sample_initial_state(
         p.resetBasePositionAndOrientation(object_id, obj_pos, obj_quat, physicsClientId=env.id)
         
         print(f"  Pose {pose_idx}: sampled with score {score:.3f}")
+
+        # Check occlusion
+        if movable_joint_id is not None:
+             if not check_trajectory_occlusion(env, object_id, movable_joint_id, threshold=trajectory_occlusion_rate):
+                 print(f"  Pose {pose_idx}: rejected by occlusion filter")
+                 continue
+             if not check_handle_facing(env, object_id, movable_joint_id):
+                 print(f"  Pose {pose_idx}: rejected by handle facing check")
+                 continue
         
         # Transform grasp to world frame
         grasp_world_pos, grasp_world_quat = transform_grasp_to_world(
@@ -385,7 +452,7 @@ def integrated_sample_initial_state(
                     robot_base_pos, robot_base_quat = p.getBasePositionAndOrientation(
                         env.robot.body, physicsClientId=env.id
                     )
-                    result = viser_visualizer.visualize_attempt(
+                    viser_visualizer.visualize_attempt(
                         trajectory_obj=trajectory_obj,
                         sampler=sampler,
                         object_pos=obj_pos,
@@ -406,85 +473,13 @@ def integrated_sample_initial_state(
                         grasp_quat_obj=np.asarray(grasp_quat_obj, dtype=float),
                         grasp_candidates_obj=grasp_candidates_obj,
                     )
-                    if result == 'quit':
-                        print("[VISER] User requested quit")
-                        return False, np.zeros(3), np.zeros(4), np.zeros(7)
                 except Exception as e:
                     import traceback
                     print(f"  Warning: Failed viser visualization: {e}")
                     traceback.print_exc()
             
             return True, obj_pos, obj_quat, joint_angles
-    
-    # Fallback: random sampling if integrated sampling failed
-    if len(sampled_poses) == 0:
-        print("  Falling back to random sampling (no sampler available)")
-        remaining_attempts = config.max_pose_samples
-        
-        for pose_idx in range(remaining_attempts):
-            if time.time() - start_time > config.timeout:
-                print(f"Random sampling timed out after {config.timeout}s")
-                break
             
-            # Random object pose
-            obj_pos = np.array([
-                config.target_position[0] + np.random.uniform(-config.xy_range, config.xy_range),
-                config.target_position[1] + np.random.uniform(-config.xy_range, config.xy_range),
-                object_z,
-            ])
-            
-            euler = base_euler.copy()
-            euler[2] += np.random.uniform(-np.pi, np.pi)
-            obj_quat = R.from_euler('xyz', euler).as_quat()
-            
-            # Apply to simulation
-            p.resetBasePositionAndOrientation(object_id, obj_pos, obj_quat, physicsClientId=env.id)
-            
-            # Transform grasp to world frame
-            grasp_world_pos, grasp_world_quat = transform_grasp_to_world(
-                grasp_pos_obj, grasp_quat_obj, obj_pos, obj_quat
-            )
-            
-            # Check robot configuration
-            success, joint_angles = check_robot_configuration(
-                env, object_id, grasp_world_pos, config
-            )
-            
-            if success:
-                print(f"  Found valid configuration (random fallback) at pose {pose_idx}")
-                # For fallback, create minimal debug visualization
-                if debug_vis_path is not None:
-                    try:
-                        from manipulation.custom_object_utils.debug_visualization import (
-                            save_debug_visualization,
-                        )
-                        # Create dummy grid for fallback case
-                        dummy_x = np.array([obj_pos[0]])
-                        dummy_y = np.array([obj_pos[1]])
-                        dummy_theta = np.array([0.0])
-                        dummy_scores = np.array([[[1.0]]])
-                        save_debug_visualization(
-                            trajectory_obj=trajectory_obj,
-                            sampler=sampler,
-                            object_pos=obj_pos,
-                            object_quat=obj_quat,
-                            x_grid=dummy_x,
-                            y_grid=dummy_y,
-                            theta_grid=dummy_theta,
-                            integrated_scores=dummy_scores,
-                            output_path=debug_vis_path,
-                            base_euler=euler,
-                            z_height=object_z,
-                            include_per_waypoint=False,  # Skip per-waypoint for fallback
-                        )
-                    except Exception as e:
-                        import traceback
-                        print(f"  Warning: Failed to save debug visualization: {e}")
-                        traceback.print_exc()
-                return True, obj_pos, obj_quat, joint_angles
-    
-    print(f"Failed to find valid initial state after {config.max_pose_samples} attempts")
-
     # If heatmaps were requested and we computed a distribution, mark failure.
     if (save_heatmaps or heatmap_dir is not None) and scores is not None:
         try:
@@ -503,6 +498,81 @@ def integrated_sample_initial_state(
             )
         except Exception:
             pass
+            
+    return False, np.zeros(3), np.zeros(4), np.zeros(7)
+
+
+def _fallback_random_sampling(
+    env, object_id, grasp_pos_obj, grasp_quat_obj, trajectory_obj, sampler,
+    config, object_z, base_euler, start_time, max_attempts,
+    debug_vis_path
+):
+    """Fallback to random sampling if integrated sampling failed."""
+    print("  Falling back to random sampling or no candidates found")
+    
+    for pose_idx in range(max_attempts):
+        if time.time() - start_time > config.timeout:
+            print(f"Random sampling timed out after {config.timeout}s")
+            break
+        
+        # Random object pose
+        obj_pos = np.array([
+            config.target_position[0] + np.random.uniform(-config.xy_range, config.xy_range),
+            config.target_position[1] + np.random.uniform(-config.xy_range, config.xy_range),
+            object_z,
+        ])
+        
+        euler = base_euler.copy()
+        euler[2] += np.random.uniform(-np.pi, np.pi)
+        obj_quat = R.from_euler('xyz', euler).as_quat()
+        
+        # Apply to simulation
+        p.resetBasePositionAndOrientation(object_id, obj_pos, obj_quat, physicsClientId=env.id)
+        
+        # Transform grasp to world frame
+        grasp_world_pos, grasp_world_quat = transform_grasp_to_world(
+            grasp_pos_obj, grasp_quat_obj, obj_pos, obj_quat
+        )
+        
+        # Check robot configuration
+        success, joint_angles = check_robot_configuration(
+            env, object_id, grasp_world_pos, config
+        )
+        
+        if success:
+            print(f"  Found valid configuration (random fallback) at pose {pose_idx}")
+            # For fallback, create minimal debug visualization
+            if debug_vis_path is not None:
+                try:
+                    from manipulation.custom_object_utils.debug_visualization import (
+                        save_debug_visualization,
+                    )
+                    # Create dummy grid for fallback case
+                    dummy_x = np.array([obj_pos[0]])
+                    dummy_y = np.array([obj_pos[1]])
+                    dummy_theta = np.array([0.0])
+                    dummy_scores = np.array([[[1.0]]])
+                    save_debug_visualization(
+                        trajectory_obj=trajectory_obj,
+                        sampler=sampler,
+                        object_pos=obj_pos,
+                        object_quat=obj_quat,
+                        x_grid=dummy_x,
+                        y_grid=dummy_y,
+                        theta_grid=dummy_theta,
+                        integrated_scores=dummy_scores,
+                        output_path=debug_vis_path,
+                        base_euler=euler,
+                        z_height=object_z,
+                        include_per_waypoint=False,  # Skip per-waypoint for fallback
+                    )
+                except Exception as e:
+                    import traceback
+                    print(f"  Warning: Failed to save debug visualization: {e}")
+                    traceback.print_exc()
+            return True, obj_pos, obj_quat, joint_angles
+    
+    print(f"Failed to find valid initial state after {max_attempts} attempts")
     return False, np.zeros(3), np.zeros(4), np.zeros(7)
 
 

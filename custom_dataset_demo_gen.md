@@ -177,11 +177,12 @@ recommended approach over naive rejection sampling.
 ```bash
 python manipulation/gen_demo_custom.py \
     --asset-dir data/custom_objects/sim_microwave_good \
-    --exp-name sim_microwave_demos_integrated \
     --sampling-method integrated_inverse \
     --rm4d-map data/rm4d_franka_1M.npy \
+    --object-z-offset 0.3 0.7 \
     --num-to-generate 100 \
     --max-try-times 300 \
+    --top-k-grasps 10 \
     --timeout-init 120 \
     --timeout-exec 300
 ```
@@ -204,6 +205,7 @@ python manipulation/gen_demo_custom.py \
 | `--far-distance` | 0.5 | Max EEF-to-grasp distance |
 | `--render` | False | Enable GUI visualization |
 | `--timeout-init` | 60.0 | Timeout for init state generation |
+| `--object-z-offset` | [0.3, 0.7] | Z-offset to elevate object. Randomizes between values if 2 provided |
 | `--timeout-exec` | 300.0 | Timeout for demo execution |
 
 #### RM4D / Integrated Inverse Arguments
@@ -213,6 +215,7 @@ python manipulation/gen_demo_custom.py \
 | `--rm4d-map` | None | Path to RM4D reachability map (.npy) |
 | `--approach-distance` | 0.15 | Gripper approach distance (meters) |
 | `--target-ratio` | 0.8 | Target opening ratio for manipulation |
+| `--top-k-grasps` | 10 | Number of grasps to try per config iteration |
 
 ### Algorithm Comparison
 
@@ -226,18 +229,32 @@ for each demo attempt:
     # Problem: Many attempts wasted on infeasible placements
 ```
 
-#### Integrated Inverse Method (New)
+#### Integrated Inverse Method (With Multi-Grasp Optim)
 ```python
-for each demo attempt:
-    1. Sample randomized object config (scale, joint angles)
-    2. Predict grasps for the object state
-    3. Compute in-contact trajectory in object frame
-    4. Aggregate reachability along trajectory and form a pose distribution
-    5. Sample poses from the distribution and execute on feasible ones
-    # Advantage: Samples from feasible set directly, fewer wasted attempts
+while success_count < target:
+    1. Sample randomized object config (new scale, joint angles)
+    2. Call GraspGen ONCE → retrieve top-k grasps (e.g., 10)
+    3. For each grasp in top-k:
+        a. Evaluate grasp reachability (Integrated Inverse)
+        b. If reachable, execute motion planning & simulation
+        c. If success → Save demo (keep collecting!)
+    # Advantage: Maximizes yield per GraspGen call; 
+    # different grasps have different reachability profiles.
 ```
 
 Using RM4D-based pre-filtering can improve success rate per attempt by rejecting infeasible placements before attempting expensive motion planning.
+ 
+### Robustness: Hybrid Candidate Generation
+
+To ensure reliable grasping under strict physics simulation (where "magnetic" grasping is impossible), the script uses a **hybrid strategy** to generate grasp candidates:
+
+1.  **Farthest Point Sampling (FPS):** Samples points directly from the handle's point cloud.
+    *   **Why?** Guarantees candidates are physically located *on* the handle surface. This is robust against calibration errors or sparse predictions.
+    *   **Priority:** These are tried first to ensure baseline competence (matching the original script's robust behavior).
+2.  **Predicted Grasps (GraspGen):** Uses learned grasp poses with orientation jitter.
+    *   **Why?** Provides smarter approach directions that might be hard to sample randomly.
+
+This combination ensures that if the learned model fails (e.g., suggests a grasp that collides), the system falls back to robust surface sampling.
  
 
 

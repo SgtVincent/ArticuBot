@@ -30,6 +30,29 @@ from manipulation.custom_object_utils.object_utils import detect_asset_version
 PROJECT_DIR = Path(os.environ.get("PROJECT_DIR", Path.cwd()))
 
 
+def get_object_runtime_scale(env, object_name: str) -> float:
+    """Get the actual runtime scale of an object from the simulator.
+    
+    This is the ONLY correct source for object scale during demo generation.
+    The simulator may adjust the YAML-specified scale based on AABB.
+    
+    Args:
+        env: Simulator environment with `simulator_sizes` dict.
+        object_name: Name of the object (case-insensitive).
+        
+    Returns:
+        The runtime scale factor applied to the object.
+    """
+    name_lower = object_name.lower()
+    sizes_dict = getattr(env, "simulator_sizes", {})
+    if name_lower not in sizes_dict:
+        raise ValueError(
+            f"Object '{object_name}' not found in simulator_sizes. "
+            f"Available: {list(sizes_dict.keys())}"
+        )
+    return float(sizes_dict[name_lower])
+
+
 def _derive_asset_root(urdf_path: str, asset_dir_hint: Optional[str]) -> Path:
     """Return the directory that stores mobility/json metadata for an object.
     

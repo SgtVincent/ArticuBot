@@ -642,7 +642,47 @@ def create_comprehensive_debug_gif(
     
     print(f"  [DEBUG VIS] Waypoint reachability at sampled pose: {n_reachable}/{total_waypoints}")
     
-    # Frame 1: Overview (trajectory + best-theta integrated map)
+    theta_sums = np.sum(integrated_scores, axis=(0, 1))
+    best_theta_idx = int(np.argmax(theta_sums))
+
+    # Frame 1: Overview
+    frames.append(_generate_overview_frame(
+        trajectory_world, waypoint_scores, integrated_scores, 
+        x_grid, y_grid, theta_grid, best_theta_idx, object_pos, total_waypoints, n_reachable
+    ))
+    
+    # Per-waypoint heatmaps
+    if include_per_waypoint and sampler is not None and hasattr(sampler, 'rmap'):
+        frames.extend(_generate_per_waypoint_frames(
+            sampler, trajectory_obj, trajectory_world, waypoint_scores,
+            x_grid, y_grid, theta_grid, best_theta_idx, z_height, base_euler,
+            object_pos, max_waypoint_frames
+        ))
+
+    # Integrated map slices
+    frames.extend(_generate_integrated_frames(
+        trajectory_world, waypoint_scores, integrated_scores,
+        x_grid, y_grid, theta_grid, object_pos
+    ))
+
+    # Summary frame
+    fig = create_summary_frame(
+        trajectory_obj, trajectory_world, waypoint_scores,
+        integrated_scores, x_grid, y_grid, theta_grid,
+        object_pos, z_height
+    )
+    frames.append(fig_to_array(fig))
+    plt.close(fig)
+    
+    # Save GIF
+    imageio.mimsave(str(output_path), frames, fps=fps)
+    print(f"  [DEBUG VIS] Saved to: {output_path}")
+
+
+def _generate_overview_frame(
+    trajectory_world, waypoint_scores, integrated_scores,
+    x_grid, y_grid, theta_grid, best_theta_idx, object_pos, total_waypoints, n_reachable
+):
     fig = plt.figure(figsize=(18, 8))
     ax_traj = fig.add_subplot(1, 2, 1, projection='3d')
     ax_map = fig.add_subplot(1, 2, 2)
@@ -655,10 +695,6 @@ def create_comprehensive_debug_gif(
         title=f"Trajectory Overview ({n_reachable}/{total_waypoints} reachable)",
         highlight_waypoint=None,
     )
-
-    # Find best theta index (one with highest integrated score)
-    theta_sums = np.sum(integrated_scores, axis=(0, 1))
-    best_theta_idx = int(np.argmax(theta_sums))
 
     im = plot_integrated_inverse_map_on_ax(
         ax_map,
@@ -673,65 +709,73 @@ def create_comprehensive_debug_gif(
     fig.colorbar(im, ax=ax_map, shrink=0.85, aspect=20).set_label('Reachability Score')
     fig.suptitle("Integrated Inverse Sampling Debug", fontsize=14)
     plt.tight_layout()
-    frames.append(fig_to_array(fig))
+    img = fig_to_array(fig)
     plt.close(fig)
+    return img
+
+
+def _generate_per_waypoint_frames(
+    sampler, trajectory_obj, trajectory_world, waypoint_scores,
+    x_grid, y_grid, theta_grid, best_theta_idx, z_height, base_euler,
+    object_pos, max_waypoint_frames
+):
+    print(f"  [DEBUG VIS] Computing per-waypoint heatmaps...")
     
-    # Per-waypoint heatmaps (optional, but helpful for debugging)
-    if include_per_waypoint and sampler is not None and hasattr(sampler, 'rmap'):
-        print(f"  [DEBUG VIS] Computing per-waypoint heatmaps...")
-        
-        # Compute per-waypoint scores
-        per_wp_scores = compute_per_waypoint_scores_grid(
-            sampler.rmap, trajectory_obj, x_grid, y_grid, theta_grid,
-            z_height, base_euler
+    per_wp_scores = compute_per_waypoint_scores_grid(
+        sampler.rmap, trajectory_obj, x_grid, y_grid, theta_grid,
+        z_height, base_euler
+    )
+    
+    n_waypoints = len(trajectory_obj)
+    step = max(1, n_waypoints // max_waypoint_frames)
+    waypoint_indices = list(range(0, n_waypoints, step))[:max_waypoint_frames]
+    
+    frames = []
+    for wp_idx in waypoint_indices:
+        ee_pos = trajectory_world[wp_idx][1]
+
+        fig = plt.figure(figsize=(18, 8))
+        ax_traj = fig.add_subplot(1, 2, 1, projection='3d')
+        ax_map = fig.add_subplot(1, 2, 2)
+
+        plot_trajectory_with_scores_on_ax(
+            ax_traj,
+            trajectory_world,
+            waypoint_scores,
+            object_pos=object_pos,
+            title=f"Trajectory (highlight wp {wp_idx})",
+            highlight_waypoint=int(wp_idx),
         )
-        
-        # Select waypoints to visualize (evenly spaced)
-        n_waypoints = len(trajectory_obj)
-        step = max(1, n_waypoints // max_waypoint_frames)
-        waypoint_indices = list(range(0, n_waypoints, step))[:max_waypoint_frames]
-        
-        for wp_idx in waypoint_indices:
-            ee_pos = trajectory_world[wp_idx][1]
 
-            # Side-by-side: trajectory overview (highlight this waypoint) + heatmap
-            fig = plt.figure(figsize=(18, 8))
-            ax_traj = fig.add_subplot(1, 2, 1, projection='3d')
-            ax_map = fig.add_subplot(1, 2, 2)
+        im = plot_per_waypoint_heatmap_on_ax(
+            ax_map,
+            x_grid,
+            y_grid,
+            theta_grid,
+            per_wp_scores[wp_idx],
+            waypoint_idx=int(wp_idx),
+            theta_index=int(best_theta_idx),
+            object_pos=object_pos,
+            ee_pos_world=ee_pos,
+            title="Per-Waypoint Inverse Reachability",
+        )
+        fig.colorbar(im, ax=ax_map, shrink=0.85, aspect=20).set_label('Reachable (1) / Not Reachable (0)')
+        fig.suptitle(f"Waypoint {wp_idx} heatmap (θ=best)", fontsize=14)
+        plt.tight_layout()
+        frames.append(fig_to_array(fig))
+        plt.close(fig)
+    return frames
 
-            plot_trajectory_with_scores_on_ax(
-                ax_traj,
-                trajectory_world,
-                waypoint_scores,
-                object_pos=object_pos,
-                title=f"Trajectory (highlight wp {wp_idx})",
-                highlight_waypoint=int(wp_idx),
-            )
 
-            im = plot_per_waypoint_heatmap_on_ax(
-                ax_map,
-                x_grid,
-                y_grid,
-                theta_grid,
-                per_wp_scores[wp_idx],
-                waypoint_idx=int(wp_idx),
-                theta_index=int(best_theta_idx),
-                object_pos=object_pos,
-                ee_pos_world=ee_pos,
-                title="Per-Waypoint Inverse Reachability",
-            )
-            fig.colorbar(im, ax=ax_map, shrink=0.85, aspect=20).set_label('Reachable (1) / Not Reachable (0)')
-            fig.suptitle(f"Waypoint {wp_idx} heatmap (θ=best)", fontsize=14)
-            plt.tight_layout()
-            frames.append(fig_to_array(fig))
-            plt.close(fig)
-    
-    # Integrated map slices for different theta values
+def _generate_integrated_frames(
+    trajectory_world, waypoint_scores, integrated_scores,
+    x_grid, y_grid, theta_grid, object_pos
+):
     n_theta_frames = min(8, len(theta_grid))
     theta_indices = np.linspace(0, len(theta_grid) - 1, n_theta_frames, dtype=int)
     
+    frames = []
     for theta_idx in theta_indices:
-        # Side-by-side: trajectory overview + integrated map slice
         fig = plt.figure(figsize=(18, 8))
         ax_traj = fig.add_subplot(1, 2, 1, projection='3d')
         ax_map = fig.add_subplot(1, 2, 2)
@@ -760,19 +804,7 @@ def create_comprehensive_debug_gif(
         plt.tight_layout()
         frames.append(fig_to_array(fig))
         plt.close(fig)
-    
-    # Summary statistics frame
-    fig = create_summary_frame(
-        trajectory_obj, trajectory_world, waypoint_scores,
-        integrated_scores, x_grid, y_grid, theta_grid,
-        object_pos, z_height
-    )
-    frames.append(fig_to_array(fig))
-    plt.close(fig)
-    
-    # Save GIF
-    imageio.mimsave(str(output_path), frames, fps=fps)
-    print(f"  [DEBUG VIS] Saved to: {output_path}")
+    return frames
 
 
 def create_summary_frame(
@@ -992,6 +1024,24 @@ def dump_integrated_inverse_heatmaps(
 
     # Basic stats
     scores = np.asarray(integrated_scores)
+    
+    _save_visualization_metadata(out_dir, x_grid, y_grid, theta_grid, scores, z_height, object_pos, base_euler, sampler)
+
+    if write_npz:
+        _save_integrated_npz(out_dir, x_grid, y_grid, theta_grid, scores)
+
+    if write_png:
+        _save_integrated_pngs(out_dir, x_grid, y_grid, theta_grid, scores, object_pos)
+
+    # Optional: per-waypoint maps (saved at best theta only, for tractability)
+    if save_per_waypoint and sampler is not None and trajectory_obj is not None and hasattr(sampler, "rmap"):
+        _save_per_waypoint_data(
+            out_dir, sampler, trajectory_obj, x_grid, y_grid, theta_grid, 
+            scores, z_height, base_euler, write_npz, write_png
+        )
+
+
+def _save_visualization_metadata(out_dir, x_grid, y_grid, theta_grid, scores, z_height, object_pos, base_euler, sampler):
     theta_sums = np.sum(scores, axis=(0, 1))
     best_theta_idx = int(np.argmax(theta_sums)) if theta_sums.size > 0 else 0
     max_score = float(np.max(scores)) if scores.size > 0 else 0.0
@@ -1019,40 +1069,48 @@ def dump_integrated_inverse_heatmaps(
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
-    if write_npz:
-        np.savez_compressed(
-            out_dir / "integrated_distribution.npz",
-            x_grid=np.asarray(x_grid, dtype=np.float32),
-            y_grid=np.asarray(y_grid, dtype=np.float32),
-            theta_grid=np.asarray(theta_grid, dtype=np.float32),
-            scores=np.asarray(scores, dtype=np.float32),
+
+def _save_integrated_npz(out_dir, x_grid, y_grid, theta_grid, scores):
+    np.savez_compressed(
+        out_dir / "integrated_distribution.npz",
+        x_grid=np.asarray(x_grid, dtype=np.float32),
+        y_grid=np.asarray(y_grid, dtype=np.float32),
+        theta_grid=np.asarray(theta_grid, dtype=np.float32),
+        scores=np.asarray(scores, dtype=np.float32),
+    )
+
+
+def _save_integrated_pngs(out_dir, x_grid, y_grid, theta_grid, scores, object_pos):
+    png_dir = out_dir / "integrated_theta_slices"
+    png_dir.mkdir(parents=True, exist_ok=True)
+    for theta_idx in range(int(len(theta_grid))):
+        fig = plot_integrated_inverse_map(
+            x_grid=np.asarray(x_grid),
+            y_grid=np.asarray(y_grid),
+            theta_grid=np.asarray(theta_grid),
+            scores=np.asarray(scores),
+            theta_index=int(theta_idx),
+            object_pos=np.asarray(object_pos, dtype=float) if object_pos is not None else None,
+            sampled_poses=None,
+            title="Integrated Inverse Map",
         )
+        fig.savefig(png_dir / f"integrated_theta_{int(theta_idx):03d}.png", dpi=150)
+        plt.close(fig)
 
-    if write_png:
-        png_dir = out_dir / "integrated_theta_slices"
-        png_dir.mkdir(parents=True, exist_ok=True)
-        for theta_idx in range(int(len(theta_grid))):
-            fig = plot_integrated_inverse_map(
-                x_grid=np.asarray(x_grid),
-                y_grid=np.asarray(y_grid),
-                theta_grid=np.asarray(theta_grid),
-                scores=np.asarray(scores),
-                theta_index=int(theta_idx),
-                object_pos=np.asarray(object_pos, dtype=float) if object_pos is not None else None,
-                sampled_poses=None,
-                title="Integrated Inverse Map",
-            )
-            fig.savefig(png_dir / f"integrated_theta_{int(theta_idx):03d}.png", dpi=150)
-            plt.close(fig)
 
-    # Optional: per-waypoint maps (saved at best theta only, for tractability)
-    if save_per_waypoint and sampler is not None and trajectory_obj is not None and hasattr(sampler, "rmap"):
+def _save_per_waypoint_data(
+    out_dir, sampler, trajectory_obj, x_grid, y_grid, theta_grid, 
+    scores, z_height, base_euler, write_npz, write_png
+):
         if base_euler is None or z_height is None:
             # Per-waypoint grids need these to match integrated distribution.
             return
 
         per_wp_dir = out_dir / "per_waypoint_best_theta"
         per_wp_dir.mkdir(parents=True, exist_ok=True)
+        
+        theta_sums = np.sum(scores, axis=(0, 1))
+        best_theta_idx = int(np.argmax(theta_sums)) if theta_sums.size > 0 else 0
 
         per_wp_scores = compute_per_waypoint_scores_grid(
             sampler.rmap,

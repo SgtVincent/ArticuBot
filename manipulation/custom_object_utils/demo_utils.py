@@ -181,10 +181,10 @@ def create_variant_config(
             block["urdf_path"] = str(urdf_path)
 
         if "size" in block:
-            # Scale randomization based on the base size
-            base_size = float(block["size"])
+            # Scale randomization: Ignore base size (often from scale.txt) and use size-scale directly
+            # as requested by user.
             scale = np.random.uniform(size_range[0], size_range[1])
-            block["size"] = base_size * scale
+            block["size"] = scale
             
         if "center" in block:
             # Note: 'center' here is kept as URDF geometric center for initial loading
@@ -263,6 +263,7 @@ def _custom_gen_init_state(
     object_traj_path: Optional[str] = None,
     coverage_threshold: float = 0.8,
     reachability_threshold: float = 0.5,
+    trajectory_occlusion_rate: float = 0.5,
 ):
     """Generate initial state for custom object demo.
     
@@ -429,6 +430,15 @@ def _custom_gen_init_state(
                 # Reject poses that fall outside the robot workspace
                 continue
 
+        # Check trajectory occlusion (Heuristic)
+        from manipulation.custom_object_utils.occlusion_utils import check_trajectory_occlusion, check_handle_facing
+        # Robot base is at origin in world frame for these checks usually
+        if not check_trajectory_occlusion(env, object_id, handle_joint_id, threshold=trajectory_occlusion_rate):
+             continue
+        if not check_handle_facing(env, object_id, handle_joint_id):
+             continue
+
+
         if predicted_grasp_pos is not None:
             # Use predicted grasp
             grasp_pos_world, _ = p.multiplyTransforms(new_pos, new_orient, predicted_grasp_pos, predicted_grasp_orn)
@@ -577,6 +587,7 @@ def custom_gen_init_state(
     object_traj_path: Optional[str] = None,
     coverage_threshold: float = 0.8,
     reachability_threshold: float = 0.5,
+    trajectory_occlusion_rate: float = 0.5,
 ):
     q = mp.Queue()
     proc = mp.Process(
@@ -592,6 +603,7 @@ def custom_gen_init_state(
             object_traj_path,
             coverage_threshold,
             reachability_threshold,
+            trajectory_occlusion_rate,
         ),
     )
     proc.start()
@@ -613,12 +625,21 @@ def custom_gen_init_state(
 
 
 def _custom_execute_wrapper(q, config_path, env_name, solution_path, experiment_path, time_string=None):
-    # Monkeypatch approach_object_link_parallel in the subprocess
-    articulated_env_module.approach_object_link_parallel = custom_api.approach_object_link_parallel
-    
-    # Call the original _execute
-    base_inner_execute(q, config_path, env_name, solution_path, experiment_path, time_string)
-
+    print(f"[DEBUG] _custom_execute_wrapper started.")
+    try:
+        # Monkeypatch approach_object_link_parallel in the subprocess
+        # We use the defaults (False/False) for collision/kinematic options now, strictly physics-based.
+        articulated_env_module.approach_object_link_parallel = custom_api.approach_object_link_parallel
+        
+        print("[DEBUG] Monkeypatch successful (strict physics).")
+        
+        # Call the original _execute
+        base_inner_execute(q, config_path, env_name, solution_path, experiment_path, time_string)
+    except Exception as e:
+        print(f"[DEBUG] Exception in _custom_execute_wrapper: {e}")
+        import traceback
+        traceback.print_exc()
+        q.put(False)
 
 def custom_execute(config_path, env_name, solution_path, experiment_path, timeout: float = 300.0):
     q = mp.Queue()
