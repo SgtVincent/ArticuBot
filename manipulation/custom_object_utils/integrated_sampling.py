@@ -193,6 +193,7 @@ def integrated_sample_initial_state(
     object_urdf_path: Optional[str] = None,
     object_scale: float = 1.0,
     grasp_candidates_obj: Optional[List[Tuple[np.ndarray, np.ndarray, float]]] = None,
+    enable_occlusion_filter: bool = True,
     trajectory_occlusion_rate: float = 0.5,
 ) -> Tuple[bool, np.ndarray, np.ndarray, np.ndarray]:
     """Sample initial state using integrated inverse map approach.
@@ -265,7 +266,7 @@ def integrated_sample_initial_state(
         env, object_id, sampled_poses, grasp_pos_obj, grasp_quat_obj,
         trajectory_obj, sampler, base_euler, object_z,
         x_grid, y_grid, theta_grid, scores, 
-        config, start_time, trajectory_occlusion_rate,
+        config, start_time, enable_occlusion_filter, trajectory_occlusion_rate,
         debug_vis_path, save_heatmaps, heatmap_dir, attempt_number,
         viser_visualizer, object_urdf_path, object_scale, grasp_candidates_obj
     )
@@ -355,12 +356,32 @@ def _validate_candidate_poses(
     env, object_id, sampled_poses, grasp_pos_obj, grasp_quat_obj,
     trajectory_obj, sampler, base_euler, object_z,
     x_grid, y_grid, theta_grid, scores, 
-    config, start_time, trajectory_occlusion_rate,
+    config, start_time, enable_occlusion_filter, trajectory_occlusion_rate,
     debug_vis_path, save_heatmaps, heatmap_dir, attempt_number,
     viser_visualizer, object_urdf_path, object_scale, grasp_candidates_obj
 ):
     """Validate sampled poses against collision and robot reachability."""
     from manipulation.custom_object_utils.occlusion_utils import check_trajectory_occlusion, check_handle_facing
+
+    rejection_stats = {
+        "z_below_ground": 0,
+        "trajectory_occlusion": 0,
+        "trajectory_facing": 0,
+        "handle_facing": 0,
+    }
+    total_checked = 0
+
+    def _log_rejection_stats(tag: str) -> None:
+        if enable_occlusion_filter:
+            print(
+                f"[INTEGRATED][{tag}] candidates={total_checked}, "
+                f"z_below_ground={rejection_stats['z_below_ground']}, "
+                f"trajectory_occlusion={rejection_stats['trajectory_occlusion']}, "
+                f"trajectory_facing={rejection_stats['trajectory_facing']}, "
+                f"handle_facing={rejection_stats['handle_facing']}"
+            )
+        else:
+            print(f"[INTEGRATED][{tag}] candidates={total_checked} (occlusion filter disabled)")
     
     # Identify movable joint (heuristic: first non-fixed)
     movable_joint_id = None
@@ -376,17 +397,75 @@ def _validate_candidate_poses(
         
         # Apply to simulation
         p.resetBasePositionAndOrientation(object_id, obj_pos, obj_quat, physicsClientId=env.id)
-        
+
         print(f"  Pose {pose_idx}: sampled with score {score:.3f}")
+        total_checked += 1
+
+        # Check if object is above ground (AABB min z > 0)
+        aabb_min, _ = p.getAABB(object_id, physicsClientId=env.id)
+        if aabb_min[2] <= 1e-4:
+            rejection_stats["z_below_ground"] += 1
+            continue
 
         # Check occlusion
-        if movable_joint_id is not None:
-             if not check_trajectory_occlusion(env, object_id, movable_joint_id, threshold=trajectory_occlusion_rate):
-                 print(f"  Pose {pose_idx}: rejected by occlusion filter")
-                 continue
-             if not check_handle_facing(env, object_id, movable_joint_id):
-                 print(f"  Pose {pose_idx}: rejected by handle facing check")
-                 continue
+        if enable_occlusion_filter:
+            aabb_min, aabb_max = p.getAABB(object_id, physicsClientId=env.id)
+            obj_center = (np.array(aabb_min) + np.array(aabb_max)) / 2.0
+            try:
+                robot_pos, _ = p.getBasePositionAndOrientation(env.robot.body, physicsClientId=env.id)
+                robot_pos = np.array(robot_pos, dtype=float)
+            except Exception:
+                robot_pos = None
+
+            if robot_pos is not None and trajectory_obj:
+                vec_base = robot_pos - obj_center
+                pos_count = 0
+                total_count = 0
+                r_obj = R.from_quat(obj_quat)
+                for _, traj_pos_obj in trajectory_obj:
+                    traj_pos_world = r_obj.apply(np.array(traj_pos_obj, dtype=float)) + np.array(obj_pos, dtype=float)
+                    vec_traj = traj_pos_world - obj_center
+                    if np.dot(vec_traj[:2], vec_base[:2]) > 0.0:
+                        pos_count += 1
+                    total_count += 1
+                if total_count > 0:
+                    ratio = pos_count / float(total_count)
+                    if ratio < 0.5:
+                        rejection_stats["trajectory_facing"] += 1
+                        print(
+                            f"  Pose {pose_idx}: rejected by trajectory-facing check (ratio={ratio:.2f})"
+                        )
+                        continue
+
+            handle_pos_world = None
+            handle_joint_for_filter = movable_joint_id
+            try:
+                handle_pts, handle_joint_ids, _, _ = env.get_handle_pos(return_median=True)
+                if handle_pts:
+                    handle_pos_world = np.array(handle_pts[0], dtype=float)
+                if handle_joint_ids:
+                    handle_joint_for_filter = handle_joint_ids[0]
+            except Exception:
+                handle_pos_world = None
+
+            if not check_trajectory_occlusion(
+                env,
+                object_id,
+                handle_joint_for_filter,
+                threshold=trajectory_occlusion_rate,
+            ):
+                rejection_stats["trajectory_occlusion"] += 1
+                print(f"  Pose {pose_idx}: rejected by occlusion filter")
+                continue
+            if not check_handle_facing(
+                env,
+                object_id,
+                handle_joint_for_filter,
+                handle_pos_world=handle_pos_world,
+            ):
+                rejection_stats["handle_facing"] += 1
+                print(f"  Pose {pose_idx}: rejected by handle facing check")
+                continue
         
         # Transform grasp to world frame
         grasp_world_pos, grasp_world_quat = transform_grasp_to_world(
@@ -400,6 +479,7 @@ def _validate_candidate_poses(
         
         if success:
             print(f"  Found valid configuration at pose {pose_idx}")
+            _log_rejection_stats("success")
 
             # Record selected pose in heatmap folder.
             if (save_heatmaps or heatmap_dir is not None) and scores is not None:
@@ -498,7 +578,7 @@ def _validate_candidate_poses(
             )
         except Exception:
             pass
-            
+    _log_rejection_stats("failure")
     return False, np.zeros(3), np.zeros(4), np.zeros(7)
 
 

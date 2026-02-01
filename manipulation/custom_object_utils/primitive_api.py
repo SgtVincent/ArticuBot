@@ -644,9 +644,16 @@ def parallel_motion_planning(args):
     obstacles = [simulator.urdf_ids[x] for x in all_objects]
     # Allow gripper fingers AND hand base (palm) to collide with the object.
     # This prevents the motion planner from rejecting grasps where the palm is near the object surface.
-    allow_collision_links = list(simulator.robot.right_gripper_indices)
-    if hasattr(simulator.robot, 'right_hand'):
-        allow_collision_links.append(simulator.robot.right_hand)
+    # allow_collision_links = list(simulator.robot.right_gripper_indices)
+    # if hasattr(simulator.robot, 'right_hand'):
+    #     allow_collision_links.append(simulator.robot.right_hand)
+    
+    # [FIX] Enforce collision checking for gripper during motion planning.
+    # Since we are planning to a "pre-grasp" standoff pose (~10cm away), the gripper
+    # should NOT be colliding with the object yet. Disabling this allows the planner
+    # to generate paths where the gripper clips through the object.
+    allow_collision_links = []
+    
     cur_eef_pos, cur_eef_orient = simulator.robot.get_pos_orient(simulator.robot.right_end_effector)
     translation_length = np.linalg.norm(mp_target_pos - cur_eef_pos)
     rotation_length = 2 * np.arccos(np.abs(np.dot(target_orientation, cur_eef_orient)))

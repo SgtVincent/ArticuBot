@@ -70,7 +70,7 @@ def check_trajectory_occlusion(env, object_id, handle_joint_id, threshold=0.5):
             
     return True
 
-def check_handle_facing(env, object_id, handle_joint_id):
+def check_handle_facing(env, object_id, handle_joint_id, handle_pos_world=None):
     """
     Checks if the handle (affordance point) is on the side of the object facing the robot.
     Geometry: Dot(Vec(Robot->ObjCenter), Vec(ObjCenter->Handle)) < 0.
@@ -78,7 +78,7 @@ def check_handle_facing(env, object_id, handle_joint_id):
     
     Returns: True if VALID (handle is on robot side), False if invalid.
     """
-    if handle_joint_id is None:
+    if handle_joint_id is None and handle_pos_world is None:
         return True
         
     # 1. Get Object Center (AABB of the whole object, excluding handle if possible? 
@@ -87,10 +87,15 @@ def check_handle_facing(env, object_id, handle_joint_id):
     aabb_min, aabb_max = p.getAABB(object_id, physicsClientId=env.id)
     obj_center = (np.array(aabb_min) + np.array(aabb_max)) / 2.0
     
-    # 2. Get Handle Position (Use AABB Center of the LINK, not the Joint Frame)
+    # 2. Get Handle Position (Use affordance median if provided, else AABB center of the link)
     # The joint frame is the hinge. The AABB center captures the physical "Door/Handle" location better.
-    h_min, h_max = p.getAABB(object_id, handle_joint_id, physicsClientId=env.id)
-    handle_pos = (np.array(h_min) + np.array(h_max)) / 2.0
+    if handle_pos_world is not None:
+        handle_pos = np.array(handle_pos_world, dtype=float)
+    else:
+        if handle_joint_id is None:
+            return True
+        h_min, h_max = p.getAABB(object_id, handle_joint_id, physicsClientId=env.id)
+        handle_pos = (np.array(h_min) + np.array(h_max)) / 2.0
     
     # 3. Get Robot Base Position
     robot_pos, _ = p.getBasePositionAndOrientation(env.robot.body, physicsClientId=env.id)
@@ -135,9 +140,11 @@ def check_handle_facing(env, object_id, handle_joint_id):
     
     if hit_obj == object_id:
         if hit_link == -1: # Hit the static base/body
-             cprint(f"  [Reject] Handle occluded by object body (hit link -1)", "yellow")
-             return False
-        # If it hits another link (not handle, not base), it might be okay or bad. 
+            cprint(f"  [Reject] Handle occluded by object body (hit link -1)", "yellow")
+            return False
+        if handle_joint_id is not None and hit_link != handle_joint_id:
+            return False
+        # If it hits another link (not handle, not base), it might be okay or bad.
         # But if it hits the handle (hit_link == handle_joint_id), strictly good.
         
     return True

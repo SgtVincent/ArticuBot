@@ -32,7 +32,7 @@ import numpy as np
 import time
 from termcolor import cprint
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 from manipulation.envs.articulated import handle_name_dict
 from manipulation.gen_demo import get_current_num_demos
@@ -109,9 +109,6 @@ def parse_args() -> argparse.Namespace:
     # RM4D parameters (used by integrated inverse sampling)
     parser.add_argument("--rm4d-map", type=pathlib.Path, default=None,
                         help="Path to RM4D reachability map (.npy)")
-
-    parser.add_argument("--trajectory-occlusion-rate", type=float, default=0.5,
-                        help="Threshold for occlusion alignment check (reject if dot < -threshold). Default 0.5.")
     
     # Integrated inverse map parameters
     _add_integrated_args(parser)
@@ -257,6 +254,18 @@ def _add_debug_args(parser):
                         help="Enable interactive 3D visualization with viser (waits for keyboard input between attempts)")
     parser.add_argument("--viser-port", type=int, default=8080,
                         help="Port number for viser server (default: 8080)")
+    
+    # Filtering layer control (for benchmarking / ablation studies)
+    parser.add_argument(
+        "--disable-prefilter",
+        action="store_true",
+        help="Disable affordance pre-filter (geometric workspace + facing check). For benchmarking."
+    )
+    parser.add_argument(
+        "--disable-occlusion-filter",
+        action="store_true",
+        help="Disable occlusion/facing filter during init state sampling."
+    )
 
 
 
@@ -294,7 +303,7 @@ def _resolve_annotation_path(args: argparse.Namespace) -> None:
 
     args.annotation_path = resolved_annotation
 
-    if not args.annotation_path.exists():
+    if args.annotation_path is None or not args.annotation_path.exists():
         raise FileNotFoundError(f"Annotation JSON not found at {args.annotation_path}")
 
 
@@ -339,6 +348,13 @@ def validate_and_prepare_args(args: argparse.Namespace) -> None:
 
     _validate_grasp_source(args)
     _validate_integrated_inverse_args(args)
+
+    if getattr(args, "disable_prefilter", False) and not getattr(args, "disable_occlusion_filter", False):
+        cprint(
+            "WARNING: --disable-prefilter is deprecated; using it to disable occlusion filter.",
+            "yellow",
+        )
+        args.disable_occlusion_filter = True
 
 
 def _validate_grasp_source(args):
@@ -544,7 +560,7 @@ def _attempt_heuristic_init(args, variant_path):
         timeout=args.timeout_init,
         rm4d_map_path=None,  # Disable RM4D-based filtering for heuristic
         object_traj_path=None,
-        trajectory_occlusion_rate=args.trajectory_occlusion_rate,
+        enable_occlusion_filter=not args.disable_occlusion_filter,
     )
     cprint(f"[TIME] custom_gen_init_state: {time.time() - t_init_start:.4f}s", "blue")
     
@@ -745,13 +761,14 @@ def _execute_grasp_attempt(
         asset_dir=str(args.asset_dir),
         debug_vis_path=debug_vis_path,
         object_z_offset=current_z_offset,
-        trajectory_occlusion_rate=args.trajectory_occlusion_rate,
         use_viser=args.use_viser,
         viser_port=args.viser_port,
         attempt_number=attempt,
         save_heatmaps=bool(getattr(args, "save_heatmaps", False)),
         heatmap_dir=heatmap_dir,
         heatmap_per_waypoint=bool(getattr(args, "heatmap_per_waypoint", False)),
+        enable_occlusion_filter=not args.disable_occlusion_filter,
+        disable_prefilter=(args.disable_prefilter or args.disable_occlusion_filter),
     )
     t_init_end = time.time()
     cprint(f"[TIME] custom_gen_init_state_integrated: {t_init_end - t_init_start:.4f}s", "blue")

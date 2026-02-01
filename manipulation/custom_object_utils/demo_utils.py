@@ -36,6 +36,10 @@ from manipulation.custom_object_utils.graspgen_client import (
     prepare_urdf_with_joint_state,
     load_predicted_grasps_yaml,
 )
+from manipulation.custom_object_utils.occlusion_utils import (
+    check_trajectory_occlusion,
+    check_handle_facing,
+)
 
 
 def get_graspgen_host_root_for_asset(asset_dir: pathlib.Path) -> str:
@@ -263,6 +267,7 @@ def _custom_gen_init_state(
     object_traj_path: Optional[str] = None,
     coverage_threshold: float = 0.8,
     reachability_threshold: float = 0.5,
+    enable_occlusion_filter: bool = True,
     trajectory_occlusion_rate: float = 0.5,
 ):
     """Generate initial state for custom object demo.
@@ -392,11 +397,49 @@ def _custom_gen_init_state(
             desired_object_z
         ])
 
-        # Random orientation around z-axis
+        # Orientation: align affordance facing robot base, then add random rotation around z-axis
+        yaw_base = base_euler[2]
+        yaw_noise = np.random.uniform(-np.pi / 6, np.pi / 6)
+        try:
+            base_quat = p.getQuaternionFromEuler([
+                init_euler[0],
+                init_euler[1],
+                yaw_base,
+            ])
+            p.resetBasePositionAndOrientation(object_id, new_pos, base_quat, physicsClientId=env.id)
+
+            handle_pos_world = None
+            try:
+                handle_pts, handle_joint_ids, _, _ = env.get_handle_pos(return_median=True)
+                if handle_pts:
+                    handle_pos_world = np.array(handle_pts[0], dtype=float)
+            except Exception:
+                handle_pos_world = None
+
+            if handle_pos_world is None and handle_joint_id is not None:
+                h_min, h_max = p.getAABB(object_id, handle_joint_id, physicsClientId=env.id)
+                handle_pos_world = (np.array(h_min) + np.array(h_max)) / 2.0
+
+            if handle_pos_world is not None:
+                aabb_min, aabb_max = p.getAABB(object_id, physicsClientId=env.id)
+                obj_center = (np.array(aabb_min) + np.array(aabb_max)) / 2.0
+                robot_pos, _ = p.getBasePositionAndOrientation(env.robot.body, physicsClientId=env.id)
+                robot_pos = np.array(robot_pos, dtype=float)
+
+                vec_handle_xy = handle_pos_world[:2] - obj_center[:2]
+                vec_robot_xy = robot_pos[:2] - obj_center[:2]
+                if np.linalg.norm(vec_handle_xy) > 1e-6 and np.linalg.norm(vec_robot_xy) > 1e-6:
+                    yaw_handle = float(np.arctan2(vec_handle_xy[1], vec_handle_xy[0]))
+                    yaw_robot = float(np.arctan2(vec_robot_xy[1], vec_robot_xy[0]))
+                    yaw_base = yaw_base + (yaw_robot - yaw_handle)
+        except Exception:
+            pass
+
+        final_yaw = yaw_base + yaw_noise
         new_orient = p.getQuaternionFromEuler([
-            init_euler[0], 
-            init_euler[1], 
-            base_euler[2] + np.random.uniform(-np.pi / 6, np.pi / 6)
+            init_euler[0],
+            init_euler[1],
+            final_yaw,
         ])
         p.resetBasePositionAndOrientation(object_id, new_pos, new_orient, physicsClientId=env.id)
 
@@ -420,6 +463,11 @@ def _custom_gen_init_state(
                 # Joint state couldn't be set (collision or constraint), try again
                 continue
 
+        # Ensure object is above ground after z-offset (AABB min z > 0)
+        aabb_min, _ = p.getAABB(object_id, physicsClientId=env.id)
+        if aabb_min[2] <= 1e-4:
+            continue
+
         # Use RM4D inverse reachability filtering if available
         if traj_filter is not None:
             R_bo = R.from_quat(new_orient).as_matrix()
@@ -430,13 +478,32 @@ def _custom_gen_init_state(
                 # Reject poses that fall outside the robot workspace
                 continue
 
-        # Check trajectory occlusion (Heuristic)
-        from manipulation.custom_object_utils.occlusion_utils import check_trajectory_occlusion, check_handle_facing
-        # Robot base is at origin in world frame for these checks usually
-        if not check_trajectory_occlusion(env, object_id, handle_joint_id, threshold=trajectory_occlusion_rate):
-             continue
-        if not check_handle_facing(env, object_id, handle_joint_id):
-             continue
+        if enable_occlusion_filter:
+            handle_pos_world = None
+            handle_joint_for_filter = handle_joint_id
+            try:
+                handle_pts, handle_joint_ids, _, _ = env.get_handle_pos(return_median=True)
+                if handle_pts:
+                    handle_pos_world = np.array(handle_pts[0], dtype=float)
+                if handle_joint_for_filter is None and handle_joint_ids:
+                    handle_joint_for_filter = handle_joint_ids[0]
+            except Exception:
+                handle_pos_world = None
+
+            if not check_trajectory_occlusion(
+                env,
+                object_id,
+                handle_joint_for_filter,
+                threshold=trajectory_occlusion_rate,
+            ):
+                continue
+            if not check_handle_facing(
+                env,
+                object_id,
+                handle_joint_for_filter,
+                handle_pos_world=handle_pos_world,
+            ):
+                continue
 
 
         if predicted_grasp_pos is not None:
@@ -587,6 +654,7 @@ def custom_gen_init_state(
     object_traj_path: Optional[str] = None,
     coverage_threshold: float = 0.8,
     reachability_threshold: float = 0.5,
+    enable_occlusion_filter: bool = True,
     trajectory_occlusion_rate: float = 0.5,
 ):
     q = mp.Queue()
@@ -603,6 +671,7 @@ def custom_gen_init_state(
             object_traj_path,
             coverage_threshold,
             reachability_threshold,
+            enable_occlusion_filter,
             trajectory_occlusion_rate,
         ),
     )

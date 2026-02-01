@@ -66,6 +66,7 @@ def _custom_gen_init_state_integrated(
     viser_port: int = 8080,
     attempt_number: int = 0,
     trajectory_occlusion_rate: float = 0.5,
+    enable_occlusion_filter: bool = True,
 ):
     """Generate initial state using integrated inverse map sampling.
     
@@ -221,6 +222,7 @@ def _custom_gen_init_state_integrated(
         object_urdf_path=object_urdf_path,
         object_scale=float(object_scale),
         grasp_candidates_obj=grasp_candidates_obj,
+        enable_occlusion_filter=enable_occlusion_filter,
         trajectory_occlusion_rate=trajectory_occlusion_rate,
     )
 
@@ -503,6 +505,8 @@ def custom_gen_init_state_integrated(
     viser_port: int = 8080,
     attempt_number: int = 0,
     trajectory_occlusion_rate: float = 0.5,
+    enable_occlusion_filter: bool = True,
+    disable_prefilter: bool = False,
 ) -> bool:
     """Generate initial state using integrated inverse map (process wrapper).
     
@@ -539,6 +543,7 @@ def custom_gen_init_state_integrated(
         True if initialization succeeded, False otherwise.
     """
     q = mp.Queue()
+    effective_occlusion_filter = bool(enable_occlusion_filter) and not bool(disable_prefilter)
     proc = mp.Process(
         target=_custom_gen_init_state_integrated,
         args=(
@@ -567,6 +572,7 @@ def custom_gen_init_state_integrated(
             viser_port,
             attempt_number,
             trajectory_occlusion_rate,
+            effective_occlusion_filter,
         ),
     )
     proc.start()

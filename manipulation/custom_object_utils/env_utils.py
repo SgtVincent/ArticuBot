@@ -70,7 +70,10 @@ def _derive_asset_root(urdf_path: str, asset_dir_hint: Optional[str]) -> Path:
                 return hint_path.parent
             return hint_path
     
-    urdf_parent = Path(urdf_path).parent.resolve()
+    try:
+        urdf_parent = Path(urdf_path).parent.resolve()
+    except OSError:
+        urdf_parent = Path(urdf_path).parent
     
     # Check if URDF is in a urdf/ subdirectory (v2 format)
     if urdf_parent.name == "urdf":
