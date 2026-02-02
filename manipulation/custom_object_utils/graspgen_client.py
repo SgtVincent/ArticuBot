@@ -26,6 +26,7 @@ import tempfile
 import shutil
 import uuid
 import hashlib
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -81,12 +82,103 @@ def _default_host_graspgen_root() -> str:
     return str((repo_root / "data").resolve())
 
 
+def _default_container_name() -> str:
+    return os.environ.get("GRASPGEN_CONTAINER_NAME", "friendly_galileo")
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _resolve_graspgen_gpu_id() -> Optional[str]:
+    gpu_id = os.environ.get("GRASPGEN_GPU_ID")
+    if gpu_id is not None and str(gpu_id).strip() != "":
+        return str(gpu_id).strip()
+
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible:
+        first = cuda_visible.split(",")[0].strip()
+        if first:
+            return first
+    return None
+
+
+_CONTAINER_READY = set()
+
+
+def _container_is_running(name: str) -> bool:
+    try:
+        res = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+        if res.returncode != 0:
+            return False
+        return name in (res.stdout or "").split()
+    except Exception:
+        return False
+
+
+def _wait_for_graspgen_ready(config: "GraspGenConfig", timeout_s: float = 900.0) -> bool:
+    start = time.time()
+    last_err = None
+    while time.time() - start < timeout_s:
+        res = _docker_exec(config, "python -c 'import grasp_gen'", timeout=30.0)
+        if res.returncode == 0:
+            return True
+        last_err = res.stderr or res.stdout
+        time.sleep(5.0)
+
+    print(
+        f"[GraspGen] Container '{config.container_name}' not ready after {timeout_s:.0f}s."
+        f" Last error: {last_err}"
+    )
+    return False
+
+
+def _ensure_graspgen_container(config: "GraspGenConfig") -> None:
+    if config.container_name in _CONTAINER_READY:
+        return
+
+    if not _env_flag("GRASPGEN_AUTOSTART", True):
+        return
+
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "run_graspgen_container.sh"
+    if not script_path.exists():
+        print(f"[GraspGen] Auto-start skipped; script not found: {script_path}")
+        return
+
+    cmd = ["bash", str(script_path), "--name", config.container_name]
+    gpu_id = _resolve_graspgen_gpu_id()
+    if gpu_id is not None:
+        cmd.extend(["--gpu-id", gpu_id])
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        if _container_is_running(config.container_name):
+            if _wait_for_graspgen_ready(config):
+                _CONTAINER_READY.add(config.container_name)
+            return
+
+        msg = result.stderr or result.stdout
+        print(f"[GraspGen] Failed to auto-start container '{config.container_name}': {msg}")
+        return
+
+    if _wait_for_graspgen_ready(config):
+        _CONTAINER_READY.add(config.container_name)
+
+
 @dataclass
 class GraspGenConfig:
     """Configuration for GraspGen Docker calls."""
     
     # Docker settings
-    container_name: str = "friendly_galileo"
+    container_name: str = field(default_factory=_default_container_name)
     
     # GraspGen script settings
     gripper_config: str = "GraspGenModels/checkpoints/graspgen_franka_panda.yml"
@@ -198,10 +290,9 @@ def _docker_exec(config: GraspGenConfig, shell_cmd: str, *, timeout: Optional[fl
         "-w",
         config.container_workdir,
     ]
-    
-    # Propagate CUDA_VISIBLE_DEVICES if set, to distribute load across GPUs
-    # when running multiple parallel instances.
-    if "CUDA_VISIBLE_DEVICES" in os.environ:
+
+    # Propagate CUDA_VISIBLE_DEVICES only when we are not pinning a per-GPU container.
+    if os.environ.get("GRASPGEN_GPU_ID") is None and "CUDA_VISIBLE_DEVICES" in os.environ:
         docker_cmd.extend(["-e", f"CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"])
 
     docker_cmd.extend([
@@ -377,7 +468,7 @@ def run_graspgen_in_docker(
         "docker", "exec", "-w", config.container_workdir,
     ]
 
-    if "CUDA_VISIBLE_DEVICES" in os.environ:
+    if os.environ.get("GRASPGEN_GPU_ID") is None and "CUDA_VISIBLE_DEVICES" in os.environ:
         docker_cmd.extend(["-e", f"CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"])
 
     docker_cmd.extend([
@@ -435,6 +526,8 @@ def predict_grasps_for_urdf_folder(
     """
     if config is None:
         config = GraspGenConfig()
+
+    _ensure_graspgen_container(config)
     
     urdf_folder_host = str(Path(urdf_folder_host).resolve())
 

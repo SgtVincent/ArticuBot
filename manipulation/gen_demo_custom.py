@@ -28,6 +28,7 @@ import os
 import pathlib
 import random
 import multiprocessing as mp
+import subprocess
 import numpy as np
 import time
 from termcolor import cprint
@@ -148,6 +149,8 @@ def _add_basic_args(parser):
                         help="Maximum attempts before giving up")
     parser.add_argument("--env-name", default="articulated_custom_object",
                         help="Environment name for simulation")
+    parser.add_argument("--process-index", type=int, default=None,
+                        help="Optional process index: when set, used to derive per-process seed (base seed + index if --seed provided)")
 
 
 def _add_object_agrs(parser):
@@ -191,7 +194,7 @@ def _add_randomization_args(parser):
         ),
     )
     parser.add_argument("--seed", type=int, default=None,
-                        help="Random seed for reproducibility")
+                        help="Random seed for reproducibility (base seed for parallel runs)")
 
 
 def _add_urdf_args(parser):
@@ -268,6 +271,52 @@ def _add_debug_args(parser):
     )
 
 
+def _get_gpu_count() -> int:
+    raw = os.environ.get("ARTICUBOT_NUM_GPUS")
+    if raw is not None:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if result.returncode == 0:
+            lines = [line for line in (result.stdout or "").splitlines() if line.strip().startswith("GPU")]
+            return len(lines)
+    except Exception:
+        pass
+    return 0
+
+
+def _configure_graspgen_gpu(args: argparse.Namespace) -> None:
+    if getattr(args, "process_index", None) is None:
+        return
+
+    num_gpus = _get_gpu_count()
+    if num_gpus <= 0:
+        cprint("No GPUs detected; skipping per-process GraspGen GPU assignment.", "yellow")
+        return
+
+    gpu_id = int(args.process_index) % num_gpus
+    base_name = os.environ.get("GRASPGEN_CONTAINER_BASE_NAME", "friendly_galileo")
+    container_name = f"{base_name}_gpu{gpu_id}"
+
+    os.environ["GRASPGEN_CONTAINER_NAME"] = container_name
+    os.environ["GRASPGEN_GPU_ID"] = str(gpu_id)
+    os.environ.setdefault("GRASPGEN_AUTOSTART", "1")
+
+    cprint(
+        f"GraspGen GPU assignment: process {args.process_index} -> GPU {gpu_id} (container {container_name})",
+        "cyan",
+    )
+
+
 
 def _resolve_annotation_path(args: argparse.Namespace) -> None:
     """Resolve annotation path logic extracted from validate_and_prepare_args."""
@@ -320,6 +369,20 @@ def validate_and_prepare_args(args: argparse.Namespace) -> None:
     if args.seed is not None:
         random.seed(args.seed)
         np.random.seed(args.seed)
+        os.environ["PYTHONHASHSEED"] = str(args.seed)
+
+    # If a per-process index is supplied, derive a per-process seed from it.
+    if getattr(args, "process_index", None) is not None:
+        if args.seed is not None:
+            derived_seed = int(args.seed + int(args.process_index))
+        else:
+            derived_seed = int(args.process_index)
+        random.seed(derived_seed)
+        np.random.seed(derived_seed % (2**32))
+        os.environ["PYTHONHASHSEED"] = str(derived_seed)
+        cprint(f"Using process index {args.process_index} to derive seed {derived_seed}", "cyan")
+
+    _configure_graspgen_gpu(args)
 
     args.asset_dir = pathlib.Path(args.asset_dir).expanduser().resolve()
     if not args.asset_dir.exists():

@@ -19,6 +19,7 @@ Options:
   --image IMAGE          Docker image (default: graspgen:latest)
   --code-dir PATH        Host GraspGen code dir mounted to /code (default: <repo>/third_party/GraspGen)
   --repo-dir PATH        Host repo dir mounted to /workspace (default: <repo>)
+  --gpu-id N             Pin container to a single GPU id (uses --gpus "device=N")
   --no-gpu               Disable GPU usage (--gpus all omitted)
   --recreate             Remove any existing container with the same name and create a fresh one
   --attach               Attach an interactive shell after start
@@ -45,6 +46,7 @@ IMAGE="graspgen:latest"
 CODE_DIR="${REPO_ROOT}/third_party/GraspGen"
 REPO_DIR="${REPO_ROOT}"
 USE_GPU=1
+GPU_ID=""
 RECREATE=0
 ATTACH=0
 
@@ -54,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --image) IMAGE="$2"; shift 2;;
     --code-dir) CODE_DIR="$2"; shift 2;;
     --repo-dir) REPO_DIR="$2"; shift 2;;
+    --gpu-id) GPU_ID="$2"; shift 2;;
     --no-gpu) USE_GPU=0; shift 1;;
     --recreate) RECREATE=1; shift 1;;
     --attach) ATTACH=1; shift 1;;
@@ -111,7 +114,11 @@ fi
 
 GPU_ARGS=()
 if [[ ${USE_GPU} -eq 1 ]]; then
-  GPU_ARGS=(--gpus all -e NVIDIA_DISABLE_REQUIRE=1 -e NVIDIA_DRIVER_CAPABILITIES=all)
+  if [[ -n "${GPU_ID}" ]]; then
+    GPU_ARGS=(--gpus "device=${GPU_ID}" -e NVIDIA_DISABLE_REQUIRE=1 -e NVIDIA_DRIVER_CAPABILITIES=all)
+  else
+    GPU_ARGS=(--gpus all -e NVIDIA_DISABLE_REQUIRE=1 -e NVIDIA_DRIVER_CAPABILITIES=all)
+  fi
 fi
 
 echo "Starting GraspGen container '${NAME}'"
