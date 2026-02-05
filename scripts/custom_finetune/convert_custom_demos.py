@@ -77,6 +77,18 @@ def parse_args():
         help="Maximum number of experiments to process"
     )
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=8,
+        help="Number of worker processes for extraction (default: 8 for parallel processing)"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="Experiments per batch (0 = auto = num-workers)"
+    )
+    parser.add_argument(
         "--randomize-camera",
         type=int,
         default=0,
@@ -93,6 +105,17 @@ def parse_args():
         type=int,
         default=0,
         help="Use real-world camera settings (0 or 1)"
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        default=True,
+        help="Skip demos already converted in output directory (default: True)"
+    )
+    parser.add_argument(
+        "--no-skip-existing",
+        action="store_true",
+        help="Force re-conversion of all demos"
     )
     return parser.parse_args()
 
@@ -121,6 +144,12 @@ def check_valid_demo(demo_path: pathlib.Path) -> bool:
 
 def main():
     args = parse_args()
+
+    # Handle --no-skip-existing flag
+    skip_existing = args.skip_existing and not args.no_skip_existing
+
+    if args.batch_size <= 0:
+        args.batch_size = max(1, args.num_workers)
     
     input_path = pathlib.Path(args.input_dir).resolve()
     output_path = pathlib.Path(args.output_dir).resolve()
@@ -135,12 +164,25 @@ def main():
     cprint(f"Found {len(subdirs)} subdirectories", "cyan")
     cprint(f"  Valid demos (with all.gif, stage_lengths.json, and states/): {len(valid_demos)}", "green")
     
+    # Filter out already-converted demos if skip_existing is enabled
+    if skip_existing and output_path.exists():
+        existing_demos = {d.name for d in output_path.iterdir() if d.is_dir() and d.name not in ('demo_rgbs', 'example_pointcloud', 'action_dist')}
+        original_count = len(valid_demos)
+        valid_demos = [d for d in valid_demos if d.name not in existing_demos]
+        skipped_count = original_count - len(valid_demos)
+        if skipped_count > 0:
+            cprint(f"  Skipping {skipped_count} already-converted demos (--skip-existing enabled)", "yellow")
+            cprint(f"  Remaining demos to convert: {len(valid_demos)}", "green")
+    
     if len(valid_demos) == 0:
-        cprint("\nNo valid demos found!", "red")
-        cprint("Make sure demos have:", "yellow")
-        cprint("  - all.gif (indicates successful execution)", "yellow")
-        cprint("  - stage_lengths.json (timing information)", "yellow")
-        cprint("  - states/ folder with state_*.pkl files", "yellow")
+        cprint("\nNo demos to convert!", "red" if not skip_existing else "yellow")
+        if skip_existing:
+            cprint("All demos already converted. Use --no-skip-existing to force re-conversion.", "yellow")
+        else:
+            cprint("Make sure demos have:", "yellow")
+            cprint("  - all.gif (indicates successful execution)", "yellow")
+            cprint("  - stage_lengths.json (timing information)", "yellow")
+            cprint("  - states/ folder with state_*.pkl files", "yellow")
         return
     
     # Determine folder structure
@@ -185,7 +227,9 @@ def main():
         randomize_camera=args.randomize_camera,
         noise_real_world_pcd=args.noise_real_world_pcd,
         real_world_camera=args.real_world_camera,
-        num_experiment=args.num_experiment
+        num_experiment=args.num_experiment,
+        num_workers=args.num_workers,
+        batch_size=args.batch_size
     )
     
     # Run extraction using custom extraction function for custom objects

@@ -127,7 +127,13 @@ cd "${PROJECT_DIR}/weighted_displacement_model"
 
 # Use the original training script with num_train_objects=custom
 # This tells the dataset loader to scan the dataset_prefix directory
-torchrun --standalone --nproc_per_node=${NUM_GPUS} train_ddp_weighted_displacement.py \
+if command -v torchrun >/dev/null 2>&1; then
+  RUNNER="torchrun --standalone --nproc_per_node=${NUM_GPUS}"
+else
+  RUNNER="${PROJECT_DIR}/articubot/bin/python -m torch.distributed.run --standalone --nproc_per_node=${NUM_GPUS}"
+fi
+
+$RUNNER train_ddp_weighted_displacement.py \
     --batch_size ${BATCH_SIZE} \
     --num_epochs ${NUM_EPOCHS} \
     --lr ${LR} \

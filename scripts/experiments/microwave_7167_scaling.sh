@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 
 # Reproducible scaling experiment for microwave_7167:
 # - Generate 1000 successful demos (keeps all.gif per demo)
-# - Convert to training format for N in {50,100,200,500,1000}
+# - Convert to training format for N demos
 # - Finetune high-level policy per N
 # - Evaluate with eval_sim_to_sim.py on the original mesh model (keeps evaluation GIFs)
 # - Plot scaling curve
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
+
+# Source environment
+if [[ -z "${CONDA_PREFIX:-}" ]]; then
+  if [[ -f /mnt/wjb/software/miniconda3/etc/profile.d/conda.sh ]]; then
+    source /mnt/wjb/software/miniconda3/etc/profile.d/conda.sh
+  fi
+  conda activate ./articubot || echo "Warning: Failed to activate ./articubot"
+fi
 
 SIM_DATASET_DIR_DEFAULT="data/custom_objects_v2/sim"
 OBJECT_TYPE_DEFAULT="microwave"
@@ -19,7 +27,9 @@ PRETRAINED_HIGH_DEFAULT="data/high_level_200_obj_ckpt.pth"
 LOW_LEVEL_EXP_DIR_DEFAULT="data/low-level-ckpt"
 LOW_LEVEL_CKPT_DEFAULT="low-level.ckpt"
 RM4D_MAP_DEFAULT="data/rm4d_franka_1M.npy"
-SIZES_DEFAULT=(50 100 200 500 1000)
+SIZES_DEFAULT=(10 20 50 100 200)
+CONVERT_WORKERS_DEFAULT=1
+CONVERT_BATCH_SIZE_DEFAULT=0
 
 usage() {
   cat <<EOF
@@ -44,6 +54,8 @@ Options (env vars):
   LOW_LEVEL_CKPT_NAME (default: ${LOW_LEVEL_CKPT_DEFAULT})
   RM4D_MAP            (default: ${RM4D_MAP_DEFAULT})
   SIZES               (space-separated, default: "${SIZES_DEFAULT[*]}")
+  CONVERT_WORKERS     (default: ${CONVERT_WORKERS_DEFAULT})
+  CONVERT_BATCH_SIZE  (default: ${CONVERT_BATCH_SIZE_DEFAULT})  # 0 = auto (num workers)
   NUM_EPOCHS          (default: 20)
   SAVE_FREQ           (default: 5)
   NUM_TRIALS          (default: 5)
@@ -132,16 +144,22 @@ cmd_generate() {
   # IMPORTANT:
   # - If predicted_grasps.yml exists and grasp_source is auto/precomputed, gen_demo_custom.py will
   #   enforce fixed scale + fixed joint angle range to avoid grasp mismatches.
-  PYTHONUNBUFFERED=1 python -u manipulation/gen_demo_custom.py \
+  # - Parallel generation with 16 workers, 4 GPUs, and random scale 0.4-0.5
+  export ARTICUBOT_NUM_GPUS=4
+  PYTHONUNBUFFERED=1 python -u manipulation/gen_demo_custom_parallel.py \
     --asset-dir "${asset_dir}" \
     --exp-name "${demo_exp_name}" \
     --sampling-method integrated_inverse \
     --rm4d-map "${rm4d_map}" \
+    --num-workers 16 \
     --num-to-generate 1000 \
-    --max-try-times 200000 \
+    --max-try-times 5000 \
     --timeout-init 180 \
     --timeout-exec 300 \
     --grasp-source "${grasp_source}" \
+    --top-k-grasps 5 \
+    --size-scale 0.4 0.6 \
+    --object-z-offset 0.3 0.5 \
     2>&1 | tee -a "${log_path}"
 }
 
@@ -152,6 +170,9 @@ cmd_convert() {
   local object_type="${OBJECT_TYPE:-$OBJECT_TYPE_DEFAULT}"
   local object_id="${OBJECT_ID:-$OBJECT_ID_DEFAULT}"
   local demo_exp_name="${DEMO_EXP_NAME:-$DEMO_EXP_NAME_DEFAULT}"
+
+  local convert_workers="${CONVERT_WORKERS:-$CONVERT_WORKERS_DEFAULT}"
+  local convert_batch_size="${CONVERT_BATCH_SIZE:-$CONVERT_BATCH_SIZE_DEFAULT}"
 
   local asset_dir="${sim_dataset_dir}/${object_type}_${object_id}"
   local input_dir="${asset_dir}/experiment/${demo_exp_name}"
@@ -170,7 +191,9 @@ cmd_convert() {
     python scripts/custom_finetune/convert_custom_demos.py \
       --input-dir "${input_dir}" \
       --output-dir "${out_dir}" \
-      --num-experiment "${n}"
+      --num-experiment "${n}" \
+      --num-workers "${convert_workers}" \
+      --batch-size "${convert_batch_size}"
   done
 }
 
@@ -266,6 +289,7 @@ cmd_plot() {
 }
 
 cmd_all() {
+  cmd_generate
   cmd_convert
   cmd_finetune
   cmd_eval

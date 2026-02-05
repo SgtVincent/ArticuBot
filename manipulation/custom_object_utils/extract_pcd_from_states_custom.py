@@ -11,9 +11,11 @@ import json
 import os
 import pickle
 import time
+import multiprocessing as mp
 from collections import defaultdict
 import tqdm
 import yaml
+import numpy as np
 from termcolor import cprint
 
 from manipulation.utils import (
@@ -91,7 +93,24 @@ def _process_single_experiment(
     save_path,
     obs_keys
 ):
-    """Process a single experiment trajectory."""
+    """Process a single experiment trajectory.
+
+    Args:
+        experiment (str): Name of the experiment directory.
+        experiment_folder (str): Path to the folder containing experiments.
+        task_config_path (str): Path to the task configuration text file.
+        env_name (str): Name of the environment.
+        handle_name (str): Name of the object handle.
+        asset_dir_hint (str): Hint for the asset directory location.
+        angle_threshold (float): Minimum opening angle required for success.
+        args (Namespace): Arguments containing processing parameters.
+        save_path (str): Directory where processed data should be saved.
+        obs_keys (list): List of observation keys to extract.
+
+    Returns:
+        dict or None: A dictionary containing trajectory data if successful,
+            None if the experiment is invalid or fails criteria.
+    """
     traj_result = {}
     
     experiment_path = os.path.join(experiment_folder, experiment)
@@ -265,6 +284,10 @@ def _process_single_experiment(
     return traj_result
 
 
+def _process_single_experiment_unpack(args_tuple):
+    return _process_single_experiment(*args_tuple)
+
+
 def extract_pc_states_for_all_trajectories_custom(pool_args):
     """Extract point cloud states using the custom wrapper."""
     task_config_path, solution_path, env_name, exp_name, experiments, save_path, angle_threshold, args = pool_args
@@ -294,8 +317,8 @@ def extract_pc_states_for_all_trajectories_custom(pool_args):
     
     print(f"Using handle_name: {handle_name}, asset_dir_hint: {asset_dir_hint}")
     
-    for experiment in experiments:
-        result = _process_single_experiment(
+    worker_args = [
+        (
             experiment,
             experiment_folder,
             task_config_path,
@@ -305,12 +328,15 @@ def extract_pc_states_for_all_trajectories_custom(pool_args):
             angle_threshold,
             args,
             save_path,
-            obs_keys
+            obs_keys,
         )
-        
+        for experiment in experiments
+    ]
+
+    def handle_result(result):
         if result is None:
-            continue
-            
+            return
+
         if result['success']:
             all_traj_stage_lengths.append(result['stage_lengths'])
             all_traj_store_label_paths.append(result['experiment_path'])
@@ -318,33 +344,29 @@ def extract_pc_states_for_all_trajectories_custom(pool_args):
                 all_traj_obs_dict_of_list[key].append(result['traj_list'][key])
             all_view_matrices.append(result['view_matrices'])
             all_proj_matrices.append(result['proj_matrices'])
-        else:
-            label_path = os.path.join(result['experiment_path'], "label.json")
-            print(f"Skipping {experiment} - {result['reason']}")
-            try:
-                with open(label_path, "w") as f:
-                    json.dump({"good_traj": False, "failure reason": "extraction failed"}, f)
-            except:
-                pass
+            return
+
+        label_path = os.path.join(result['experiment_path'], "label.json")
+        print(f"Skipping {os.path.basename(result['experiment_path'])} - {result['reason']}")
+        try:
+            with open(label_path, "w") as f:
+                json.dump({"good_traj": False, "failure reason": "extraction failed"}, f)
+        except Exception:
+            pass
+
+    num_workers = max(1, getattr(args, "num_workers", 1))
+    if num_workers > 1 and len(worker_args) > 1:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=num_workers) as pool:
+            for result in pool.imap_unordered(_process_single_experiment_unpack, worker_args):
+                handle_result(result)
+    else:
+        for args_tuple in worker_args:
+            handle_result(_process_single_experiment_unpack(args_tuple))
     
     return all_traj_obs_dict_of_list, all_traj_stage_lengths, all_traj_store_label_paths, all_view_matrices, all_proj_matrices
 
 
-def extract_demos_from_a_directory_custom(
-    directory_path, 
-    exp_name=None, 
-    env_name=None, 
-    extract_name=None, 
-    save_path=None,
-    args=None,
-):
-    """Extract demonstrations from a directory using the custom wrapper.
-    
-    This is the main entry point for custom object demo extraction.
-    """
-    demo_rgb_save_path = os.path.join(save_path, "demo_rgbs")
-    if not os.path.exists(demo_rgb_save_path):
-        os.makedirs(demo_rgb_save_path)
 
 
 def _resolve_task_config_path(directory_path, task_path):
@@ -422,7 +444,28 @@ def _save_trajectory_demo(
     all_proj_matrices,
     args
 ):
-    """Save a single processed trajectory."""
+    """Save a single processed trajectory.
+
+    Args:
+        traj_idx (int): Index of the trajectory to save.
+        save_path (str): Directory where processed data should be saved.
+        demo_rgb_save_path (str): Directory where demo GIFs should be saved.
+        all_traj_pc (list): List of point clouds for all trajectories.
+        all_traj_pos_ori (list): List of agent positions/orientations.
+        all_traj_rgbs (list): List of RGB images.
+        all_traj_gripper_pcds (list): List of gripper point clouds.
+        all_traj_goal_gripper_pcd (list): List of goal gripper point clouds.
+        all_traj_displacement_gripper_to_object (list): List of displacements.
+        all_traj_stage_lengths (list): List of stage lengths for trajectories.
+        all_traj_store_label_paths (list): List of original paths for labeling.
+        all_view_matrices (list): List of camera view matrices.
+        all_proj_matrices (list): List of camera projection matrices.
+        args (Namespace): Arguments containing processing parameters.
+
+    Returns:
+        str or None: Path to the saved trajectory directory if successful,
+            None if the trajectory is invalid.
+    """
     traj_pc = all_traj_pc[traj_idx]
     traj_pos_ori = all_traj_pos_ori[traj_idx]
     traj_gripper_pcd = all_traj_gripper_pcds[traj_idx]
@@ -603,7 +646,7 @@ def extract_demos_from_a_directory_custom(
         angle_threshold = 0.0
     
     num_experiment = min(num_experiment, args.num_experiment)
-    batch_size = 1
+    batch_size = max(1, getattr(args, "batch_size", 1))
     num_batch = (num_experiment - 1) // batch_size + 1
     
     all_demo_paths = []
@@ -663,6 +706,14 @@ def extract_demos_from_a_directory_custom(
             if traj_path:
                 all_demo_paths.append(traj_path)
     
+    existing_demo_paths = [
+        os.path.join(save_path, name)
+        for name in os.listdir(save_path)
+        if os.path.isdir(os.path.join(save_path, name)) and name not in ("demo_rgbs", "example_pointcloud")
+    ]
+    if existing_demo_paths:
+        all_demo_paths = sorted(set(all_demo_paths + existing_demo_paths))
+
     # Save all demo paths
     all_demo_path_file = os.path.join(save_path, "all_demo_path.txt")
     with open(all_demo_path_file, "w") as f:
